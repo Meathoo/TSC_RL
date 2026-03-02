@@ -1,5 +1,8 @@
+import os
 import numpy as np
 import time
+import json
+from configs import agent_config
 
 def assign_state(state,itsx_assignment,itsx_state_dim):
 
@@ -82,6 +85,12 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
     episode_queue_length = [] # add
     episode_travel_time=[]
     """-------------"""
+
+    # ---- Training Log (timing + key metrics) ----
+    training_start_time = time.time()
+    episode_logs = []  # per-episode detailed log
+    learn_call_count = 0  # total learn() calls across all agents
+
     for episode in range(EXP_CONFIG["EPISODE"]):
         state=env.reset()
         obs=assign_state(state,itsx_assignment,EXP_CONFIG["ITSX_STATE_DIM"])
@@ -111,6 +120,7 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
                     agents[aid].store_transition(obs[aid], actions_id[aid], rewards[aid], next_obs[aid])
                 if global_step % EXP_CONFIG["LEARNING_INTERVAL"] == 0:
                     agent_learn()
+                    learn_call_count += 1
             """----update step log---"""
             step_itsx_reward.append([value for _,value in itsx_rewards.items()])
             episode_reward.append(np.average(rewards))
@@ -122,17 +132,137 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
         episode_queue_length.append(env.get_average_queue_length())  # add
         episode_intersection_level_rewards.append(np.array(step_itsx_reward))
         """----------------------------"""
+        episode_wall_time = time.time() - episode_start_time
+        elapsed_total = time.time() - training_start_time
+
+        # Collect per-agent metrics
+        agent_grad_norms = []
+        agent_lrs = []
+        agent_losses = []
+        agent_memory_counts = []
+        for agent in agents:
+            if hasattr(agent, 'grad_norm_his') and len(agent.grad_norm_his) > 0:
+                agent_grad_norms.append(float(agent.grad_norm_his[-1]))
+            if hasattr(agent, 'lr_his') and len(agent.lr_his) > 0:
+                agent_lrs.append(float(agent.lr_his[-1]))
+            if hasattr(agent, 'loss_his') and len(agent.loss_his) > 0:
+                agent_losses.append(float(agent.loss_his[-1]))
+            if hasattr(agent, 'memory_counter'):
+                agent_memory_counts.append(int(agent.memory_counter))
+
+        ep_log = {
+            "episode": episode,
+            "wall_time_sec": round(episode_wall_time, 2),
+            "elapsed_total_sec": round(elapsed_total, 2),
+            "elapsed_total_hms": time.strftime('%H:%M:%S', time.gmtime(elapsed_total)),
+            "global_step": global_step,
+            "episode_reward": round(float(np.sum(episode_reward)), 4),
+            "avg_travel_time": round(env.get_average_travel_time(), 4),
+            "avg_queue_length": round(env.get_average_queue_length(), 4),
+            "throughput": int(env.get_throughput()),
+            "epsilon": round(float(agents[0].epsilon), 6),
+            "avg_grad_norm": round(float(np.mean(agent_grad_norms)), 4) if agent_grad_norms else None,
+            "max_grad_norm": round(float(np.max(agent_grad_norms)), 4) if agent_grad_norms else None,
+            "avg_lr": round(float(np.mean(agent_lrs)), 8) if agent_lrs else None,
+            "avg_loss": round(float(np.mean(agent_losses)), 6) if agent_losses else None,
+            "memory_counter": agent_memory_counts[0] if agent_memory_counts else 0,
+            "learn_calls": learn_call_count,
+        }
+        episode_logs.append(ep_log)
+
         log_msg={
             "episode":episode,
-            "time cost":time.time()-episode_start_time,
-            "episode reward":np.sum(episode_reward),
-            "average travel time": env.get_average_travel_time(),
-            "average queue length": env.get_average_queue_length(),  # add
-            "throughput":env.get_throughput(), # add
-            "epsilon":agents[0].epsilon
-
+            "time cost":round(episode_wall_time, 2),
+            "elapsed": time.strftime('%H:%M:%S', time.gmtime(elapsed_total)),
+            "episode reward":round(float(np.sum(episode_reward)), 2),
+            "average travel time": round(env.get_average_travel_time(), 2),
+            "average queue length": round(env.get_average_queue_length(), 4),
+            "throughput":int(env.get_throughput()),
+            "epsilon":round(float(agents[0].epsilon), 6),
+            "grad_norm": round(float(np.mean(agent_grad_norms)), 2) if agent_grad_norms else '-',
+            "lr": round(float(np.mean(agent_lrs)), 8) if agent_lrs else '-',
         }
-        print(log_msg)
+        print("log_msg:\n", log_msg)
+
+        # Estimate remaining time
+        if episode > 0:
+            avg_ep_time = elapsed_total / (episode + 1)
+            remaining_eps = EXP_CONFIG["EPISODE"] - episode - 1
+            eta_sec = avg_ep_time * remaining_eps
+            print(f"  ETA: {time.strftime('%H:%M:%S', time.gmtime(eta_sec))} "
+                  f"({remaining_eps} eps remaining, "
+                  f"avg {avg_ep_time:.1f}s/ep)")
+
+    # ---- Write Training Log ----
+    total_training_time = time.time() - training_start_time
+    att_array = np.array(episode_travel_time)
+    best_att = float(att_array.min())
+    best_att_ep = int(att_array.argmin())
+    last100_att = float(att_array[-100:].mean()) if len(att_array) >= 100 else float(att_array.mean())
+
+    # Find convergence point (rolling-20 < 480)
+    converge_ep = None
+    if len(att_array) >= 20:
+        rolling = np.convolve(att_array, np.ones(20)/20, mode='valid')
+        for i in range(len(rolling)):
+            if rolling[i] < 480:
+                converge_ep = i
+                break
+
+    # per-agent param counts
+    agent_param_counts = []
+    for agent in agents:
+        pc = sum(p.numpy().size for p in agent.eval_model.trainable_weights)
+        agent_param_counts.append(pc)
+
+    training_summary = {
+        "total_training_time_sec": round(total_training_time, 1),
+        "total_training_time_hms": time.strftime('%H:%M:%S', time.gmtime(total_training_time)),
+        "total_episodes": EXP_CONFIG["EPISODE"],
+        "total_global_steps": global_step,
+        "total_learn_calls": learn_call_count,
+        "avg_sec_per_episode": round(total_training_time / max(EXP_CONFIG["EPISODE"], 1), 2),
+        "best_att": round(best_att, 2),
+        "best_att_episode": best_att_ep,
+        "last100_att": round(last100_att, 2),
+        "converge_episode_rolling20_lt480": converge_ep,
+        "agent_param_counts": agent_param_counts,
+        "features_enabled": {
+            "gradient_clipping": agent_config.BDQ_AGENT_CONFIG.get("Gradient_Clipping", False),
+            "cosine_lr": agent_config.BDQ_AGENT_CONFIG.get("CosineDecay", False),
+            "PER": agent_config.BDQ_AGENT_CONFIG.get("Prioritized_Experience_Replay", False),
+            "noisy_net": agent_config.BDQ_AGENT_CONFIG.get("NoisyNet", False),
+        },
+    }
+
+    training_log = {
+        "summary": training_summary,
+        "episodes": episode_logs,
+    }
+
+    log_path = os.path.join(ENV_CONFIG["PATH_TO_WORK_DIRECTORY"], "training_log.json")
+    with open(log_path, 'w') as f:
+        json.dump(training_log, f, indent=2, ensure_ascii=False)
+
+    # Print final summary
+    print("\n" + "=" * 60)
+    print("  TRAINING COMPLETE")
+    print("=" * 60)
+    print(f"  Total time:       {training_summary['total_training_time_hms']} "
+          f"({training_summary['total_training_time_sec']:.0f}s)")
+    print(f"  Avg per episode:  {training_summary['avg_sec_per_episode']}s")
+    print(f"  Total steps:      {global_step:,}")
+    print(f"  Learn calls:      {learn_call_count:,}")
+    print(f"  Best ATT:         {best_att:.2f} (ep {best_att_ep})")
+    print(f"  Last-100 ATT:     {last100_att:.2f}")
+    if converge_ep is not None:
+        print(f"  Converge ep:      {converge_ep} (rolling-20 < 480)")
+    else:
+        print(f"  Converge ep:      Not reached")
+    print(f"  Params/agent:     {agent_param_counts[0]:,}")
+    print(f"  Log saved:        {log_path}")
+    print("=" * 60 + "\n")
+
     sim_log={'reward_log':episode_intersection_level_rewards,
              'throughput':episode_throughput,
              'queue_length':episode_queue_length,  # add

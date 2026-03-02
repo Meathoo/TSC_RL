@@ -19,7 +19,10 @@ The python version and related packages are listed
     * `--agent`: RL agent type `BDQ` or `ABDQ`
 * ``PipeLine.py``: takes output of `main.py` and perform simulation-training process
 * ``cityflow_env_wrapper.py``: a wrapper of [cityflow](https://cityflow.readthedocs.io/en/latest/introduction.html) package with high level functions such as collecting queue length of one intersection.
-\
-This script is modified based on [CoLight](https://github.com/wingsweihua/colight/blob/master/anon_env.py).
 
-## Usage
+## Acknowledgments
+
+This project is built upon the open-source codebase provided by **HKG-RL**. We sincerely appreciate their contribution to the research community.
+
+* **Original Repository:** [https://github.com/HankangGu/RegionLight]
+* **License:** This project continues to be licensed under the [MIT License](LICENSE) (see the original copyright notice in the LICENSE file).
