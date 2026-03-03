@@ -15,3 +15,10 @@ BDQ_AGENT_CONFIG={
     "TD_OPERATOR":"MEAN",
     "LEARNING_RATE":0.0001
 }
+
+# Cross-Region Attention Communication BDQ
+COMM_BDQ_AGENT_CONFIG={
+    "TD_OPERATOR":"MEAN",
+    "LEARNING_RATE":0.0001,
+    "COMM_DIM": 64,           # 跨 Region 通訊 embedding 維度
+}

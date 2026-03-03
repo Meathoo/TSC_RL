@@ -8,6 +8,7 @@ import shutil
 from configs import agent_config, env_config, exp_config, region_config
 import copy
 from PipeLine import pipeline
+from agentpool.region_comm import build_region_adjacency, RegionCommCoordinator
 # tf.random.set_seed(0)
 
 #add
@@ -118,12 +119,30 @@ def init_exp(args):
     }
     EXP_CONFIG.update(agent_env_config)
 
-    if EXP_CONFIG["TRAINING_PARADIM"]=="CLDE":
+    # ====== Cross-Region Communication Setup ======
+    comm_coordinator = None
+    if agent_type == "CommBDQ":
+        # 自動建構 Region 鄰接圖
+        adjacency = build_region_adjacency(itsx_assignment)
+        comm_dim = agent_config.COMM_BDQ_AGENT_CONFIG.get("COMM_DIM", 64)
+        max_neighbors = max(len(n) for n in adjacency) if adjacency else 1
+        comm_coordinator = RegionCommCoordinator(adjacency, comm_dim)
+        # 傳入通訊配置給 Agent
+        comm_config = {"COMM_DIM": comm_dim, "MAX_NEIGHBORS": max_neighbors}
+    else:
+        comm_config = None
 
-        agent=EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config)
+    if EXP_CONFIG["TRAINING_PARADIM"]=="CLDE":
+        if comm_config is not None:
+            agent=EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config, comm_config)
+        else:
+            agent=EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config)
         agents=[agent for _ in range(EXP_CONFIG["AGETN_NUM"])]
     else:
-        agents = [EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config) for _ in range(EXP_CONFIG["AGETN_NUM"])]
+        if comm_config is not None:
+            agents = [EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config, comm_config) for _ in range(EXP_CONFIG["AGETN_NUM"])]
+        else:
+            agents = [EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config) for _ in range(EXP_CONFIG["AGETN_NUM"])]
     print(EXP_CONFIG)
     print(ENV_CONFIG)
 
@@ -140,10 +159,10 @@ def init_exp(args):
         file.write("EXP_CONFIG:\n" + json.dumps(exp_config_serializable, indent=2) + "\n\n")
         file.write("ENV_CONFIG:\n" + json.dumps(ENV_CONFIG, indent=2) + "\n\n")
 
-    return env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG
+    return env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,comm_coordinator
 
-def run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
-    logs=pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG)
+def run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,comm_coordinator=None):
+    logs=pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,comm_coordinator)
     plot_curve(np.array(logs['reward_log']), "Episode Intersection Reward", "Intersection Reward", os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], "plot_intersection_reward.png")) # add
     np.save(os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'],'episode_intersection_reward.npy'),logs['reward_log'])
     plot_curve(np.array(logs['throughput']), "Episode Throughput", "Throughput", os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], "plot_throughput.png")) # add
@@ -156,8 +175,8 @@ def run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
 if __name__ == "__main__":
     print("Is GPU available",tf.test.is_gpu_available())
     args = parse_args()
-    env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG=init_exp(args)
-    run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG)
+    env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,comm_coordinator=init_exp(args)
+    run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,comm_coordinator)
 
     # add by me
     model_folder = os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], 'models')

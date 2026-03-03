@@ -59,7 +59,7 @@ def convert_actions(actions_id,itsx_assignment):
             if itsx != "dummy":
                 decoded_actions[itsx] = int(a) + 1
     return decoded_actions
-def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
+def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,comm_coordinator=None):
     """
     Training pipeline that communicate agent with environment
 
@@ -68,9 +68,13 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
     :param itsx_assignment:
     :param EXP_CONFIG:
     :param ENV_CONFIG:
+    :param comm_coordinator: RegionCommCoordinator instance for inter-region comm (None=disabled)
     :return:
 
     """
+    use_comm = comm_coordinator is not None
+    if use_comm:
+        print("[Pipeline] Cross-Region Communication ENABLED")
     def agent_learn():
         if EXP_CONFIG["TRAINING_PARADIM"] == "CLDE":
             agents[0].learn()
@@ -104,9 +108,19 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
             actions_id=[]
             global_step += 1
 
-            for aid,agent in enumerate(agents):
-                action_id=agent.choose_action(obs[aid],idle_branches_id[aid])
-                actions_id.append(action_id)
+            if use_comm:
+                # ====== Cross-Region Communication Step ======
+                # 1. 各 Agent 生成 message 並交換
+                neighbor_data = comm_coordinator.exchange_messages(agents, obs)
+                # 2. 各 Agent 使用鄰居通訊資訊選擇動作
+                for aid, agent in enumerate(agents):
+                    action_id = agent.choose_action(obs[aid], neighbor_data[aid], idle_branches_id[aid])
+                    actions_id.append(action_id)
+            else:
+                for aid,agent in enumerate(agents):
+                    action_id=agent.choose_action(obs[aid],idle_branches_id[aid])
+                    actions_id.append(action_id)
+
             joint_actions=convert_actions(actions_id,itsx_assignment)
 
             next_states, itsx_rewards, done, log_metric = env.step(joint_actions)
@@ -115,9 +129,21 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
             rewards = assign_reward(itsx_rewards,itsx_assignment)
 
             if not done:
-                # only store experience and learn when not finished
-                for aid in range(len(agents)):
-                    agents[aid].store_transition(obs[aid], actions_id[aid], rewards[aid], next_obs[aid])
+                if use_comm:
+                    # 計算 next state 的鄰居通訊（用於 replay buffer）
+                    next_neighbor_data = comm_coordinator.exchange_messages(agents, next_obs)
+                    for aid in range(len(agents)):
+                        agents[aid].store_transition(
+                            obs[aid],
+                            neighbor_data[aid]['msgs'], neighbor_data[aid]['mask'],
+                            actions_id[aid], rewards[aid],
+                            next_obs[aid],
+                            next_neighbor_data[aid]['msgs'], next_neighbor_data[aid]['mask']
+                        )
+                else:
+                    # only store experience and learn when not finished
+                    for aid in range(len(agents)):
+                        agents[aid].store_transition(obs[aid], actions_id[aid], rewards[aid], next_obs[aid])
                 if global_step % EXP_CONFIG["LEARNING_INTERVAL"] == 0:
                     agent_learn()
                     learn_call_count += 1
