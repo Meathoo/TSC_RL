@@ -11,22 +11,33 @@ class Intersection:
     this class stores necessary connectivity property between intersections and roads
     """
 
-    def __init__(self, config):
+    def __init__(self, config, road_start_map=None):
         self.config = config
         self.id = config['id']
         self.enter_roads = []
         self.leave_roads = []
-        self.x = int(self.id.split('_')[1])
-        self.y = int(self.id.split('_')[2])
-        for road_id in config['roads']:
-            id_chunk = road_id.split('_')
-            road_x = int(id_chunk[1])
-            road_y = int(id_chunk[2])
-            if road_x == self.x and road_y == self.y:
-                # road share same x and y as intersection so this road leaves this intersection
-                self.leave_roads.append(road_id)
-            else:
-                self.enter_roads.append(road_id)
+
+        # Determine enter/leave roads
+        if road_start_map is not None:
+            # General approach: use road start intersection info (works for any network)
+            for road_id in config['roads']:
+                if road_start_map.get(road_id) == self.id:
+                    self.leave_roads.append(road_id)
+                else:
+                    self.enter_roads.append(road_id)
+        else:
+            # Legacy grid-based approach: parse x,y from intersection/road IDs
+            self.x = int(self.id.split('_')[1])
+            self.y = int(self.id.split('_')[2])
+            for road_id in config['roads']:
+                id_chunk = road_id.split('_')
+                road_x = int(id_chunk[1])
+                road_y = int(id_chunk[2])
+                if road_x == self.x and road_y == self.y:
+                    self.leave_roads.append(road_id)
+                else:
+                    self.enter_roads.append(road_id)
+
         self.movement = {}  # key: enter lane; value: leave lane
         self.enter_lanes = {leave_road_id: [] for leave_road_id in
                             self.leave_roads}  # key: road id ; value lane that enter this road
@@ -40,7 +51,7 @@ class Intersection:
             elif roadlink['type'] == 'turn_right':
                 lane_suffix = 2
             else:
-                raise ("unknow movement")
+                continue  # skip unknown movement types (e.g. U-turns)
             self.movement[roadlink['startRoad'] + "_" + str(lane_suffix)] = roadlink['endRoad'] + "_" + str(lane_suffix)
             self.enter_lanes[roadlink['endRoad']].append(roadlink['startRoad'] + "_" + str(lane_suffix))
 
@@ -93,9 +104,15 @@ class CityflowEnvWrapper:
         # roadnet_path = ENV_CONFIG["ROADNET_PATH"]
         self.intersections = dict()
         self.roadnet = json.load(open(os.path.join("data/", ENV_CONFIG["ROADNET_PATH"])))
+
+        # Build road -> startIntersection mapping for general enter/leave determination
+        road_start_map = {}
+        for road in self.roadnet.get('roads', []):
+            road_start_map[road['id']] = road['startIntersection']
+
         for itsx in self.roadnet['intersections']:
             if len(itsx['roads']) == 8:
-                self.intersections[itsx['id']] = Intersection(itsx)
+                self.intersections[itsx['id']] = Intersection(itsx, road_start_map)
 
         self.intersection_ids = []  # intersection with four roads
         for intersection in self.roadnet['intersections']:
@@ -166,9 +183,9 @@ class CityflowEnvWrapper:
 
         waiting_queue = []
         for in_road_id in in_roads_id:  # iterate through all incoming roads
-            for lane_index in range(3):  # each road has three lanes
+            for lane_index in range(3):  # each road has three lanes (pad 0 if fewer)
                 lane_id = in_road_id + '_' + str(lane_index)  # construct lane id
-                waiting_queue.append(lane_waiting_vehicle_count[lane_id])  # collect waiting queue on each lane
+                waiting_queue.append(lane_waiting_vehicle_count.get(lane_id, 0))  # collect waiting queue on each lane
         return waiting_queue
 
     def _collect_wave(self, intersection_id, lane_vehicle_count):
@@ -181,9 +198,9 @@ class CityflowEnvWrapper:
 
         wave_count = []
         for in_road_id in in_roads_id:  # iterate through all incoming roads
-            for lane_index in range(3):  # each road has three lanes
+            for lane_index in range(3):  # each road has three lanes (pad 0 if fewer)
                 lane_id = in_road_id + '_' + str(lane_index)  # construct lane id
-                wave_count.append(lane_vehicle_count[lane_id])  # collect waiting queue on each lane
+                wave_count.append(lane_vehicle_count.get(lane_id, 0))  # collect waiting queue on each lane
         return wave_count
 
     def _get_reward(self):
@@ -202,7 +219,7 @@ class CityflowEnvWrapper:
             for in_road_id in in_roads_id:
                 for lane_index in range(3):  # each road has three lanes
                     lane_id = in_road_id + '_' + str(lane_index)  # construct lane id
-                    current_reward += lane_waiting_vehicle_count[lane_id]
+                    current_reward += lane_waiting_vehicle_count.get(lane_id, 0)
         current_reward = -current_reward
         return current_reward
 
@@ -288,7 +305,7 @@ class CityflowEnvWrapper:
             for in_road_id in in_roads_id:
                 for lane_index in range(3):  # each road has three lanes
                     lane_id = in_road_id + '_' + str(lane_index)
-                    total_queue += lane_waiting_vehicle_count[lane_id]
+                    total_queue += lane_waiting_vehicle_count.get(lane_id, 0)
                     lane_count += 1
         if lane_count == 0:
             return 0

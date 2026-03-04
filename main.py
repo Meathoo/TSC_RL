@@ -73,9 +73,26 @@ def init_exp(args):
     if netname == "Syn2" and netshape == "4_4":
         flow_path = os.path.join(netname, "Syn2_4_4_gaussian_500_1h.json")
         flow = "gaussian"
+        
     # if netname == "Manhattan" and netshape == "4_4":
     #     flow_path = os.path.join(netname, "Syn2_4_4_gaussian_500_1h.json")
     #     flow = "gaussian"
+
+    # ====== Manhattan_28x7 (7 rows × 28 cols grid) ======
+    if netname == "Manhattan_28x7" and netshape == "28_7":
+        net_path = os.path.join(netname, "roadnet_28_7.json")
+        # flow: "double" -> anon_28_7_newyork_real_double.json
+        #       "triple" -> anon_28_7_newyork_real_triple.json
+        flow_path = os.path.join(netname, f"anon_28_7_newyork_real_{flow}.json")
+
+    # ====== Manhattan_1_2510 (real-world Manhattan, 159 controlled intersections) ======
+    if netname == "Manhattan_1_2510":
+        netshape = "manhattan"
+        net_path = os.path.join(netname, "manhattan.json")
+        # flow: "7846", "11756", "21430", "31217"
+        flow_path = os.path.join(netname, f"manhattan_{flow}.json")
+        # Force non-regional mode (non-grid network, irregular intersection IDs)
+        EXP_CONFIG["REGIONAL"] = False
 
 
     experiment_name = "{0}_{1}_{2}".format(netname, netshape, flow)
