@@ -94,6 +94,21 @@ REGION_CONFIG = {
                         ['intersection_1_9', 'dummy', 'intersection_1_8', 'dummy', 'intersection_1_7'],
                         ['intersection_3_4', 'dummy', 'intersection_3_3', 'dummy', 'intersection_3_2'],
                         ['intersection_2_12', 'intersection_1_11', 'intersection_2_11', 'intersection_3_11', 'dummy']],
+    # ====== 6x6 (6 rows × 6 cols) ======
+    "6_6_ADJACENCY1": [
+        ['dummy', 'intersection_1_1', 'intersection_1_2', 'intersection_1_3', 'intersection_2_2'],
+        ['intersection_1_4', 'intersection_2_3', 'intersection_2_4', 'intersection_2_5', 'intersection_3_4'],
+        ['intersection_2_1', 'dummy', 'intersection_3_1', 'intersection_3_2', 'intersection_4_1'],
+        ['intersection_2_6', 'intersection_3_5', 'intersection_3_6', 'dummy', 'intersection_4_6'],
+        ['intersection_3_3', 'intersection_4_2', 'intersection_4_3', 'intersection_4_4', 'intersection_5_3'],
+        ['intersection_4_5', 'intersection_5_4', 'intersection_5_5', 'intersection_5_6', 'intersection_6_5'],
+        ['intersection_5_2', 'intersection_6_1', 'intersection_6_2', 'intersection_6_3', 'dummy'],
+        ['dummy', 'dummy', 'intersection_1_5', 'dummy', 'dummy'],
+        ['dummy', 'dummy', 'intersection_1_6', 'dummy', 'dummy'],
+        ['dummy', 'dummy', 'intersection_5_1', 'dummy', 'dummy'],
+        ['dummy', 'dummy', 'intersection_6_4', 'dummy', 'dummy'],
+        ['dummy', 'dummy', 'intersection_6_6', 'dummy', 'dummy'],
+    ],
     # ====== Manhattan 28x7 (7 rows × 28 cols) ======
     "28_7_ADJACENCY1": [
         ['dummy', 'intersection_1_1', 'intersection_1_2', 'intersection_1_3', 'intersection_2_2'],

@@ -78,6 +78,13 @@ def init_exp(args):
     #     flow_path = os.path.join(netname, "Syn2_4_4_gaussian_500_1h.json")
     #     flow = "gaussian"
 
+    # ====== 6x6 synthetic grid ======
+    if netname == "6x6" and netshape == "6_6":
+        net_path = os.path.join(netname, "roadnet_6_6.json")
+        # flow: "bi"  -> anon_6_6_300_0.3_bi.json
+        #       "uni" -> anon_6_6_300_0.3_uni.json
+        flow_path = os.path.join(netname, f"anon_6_6_300_0.3_{flow}.json")
+
     # ====== Manhattan_28x7 (7 rows × 28 cols grid) ======
     if netname == "Manhattan_28x7" and netshape == "28_7":
         net_path = os.path.join(netname, "roadnet_28_7.json")
@@ -186,3 +193,9 @@ if __name__ == "__main__":
 
 
 # python main.py --netname Hangzhou --netshape 4_4 --flow real --agent ABDQ
+
+# 雙向流量 (bi)
+# python main.py --netname 6x6 --netshape 6_6 --flow bi --agent ABDQ
+
+# 單向流量 (uni)
+# python main.py --netname 6x6 --netshape 6_6 --flow uni --agent ABDQ
