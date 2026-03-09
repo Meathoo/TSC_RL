@@ -14,6 +14,9 @@ from PipeLine import pipeline
 from plot import plot_curve
 import json
 
+# Hierarchical Region Communication
+from agentpool.region_communication import RegionCoordinator, build_region_adjacency_matrix
+
 tf.config.experimental_run_functions_eagerly(True)
 
 
@@ -148,6 +151,28 @@ def init_exp(args):
         agents=[agent for _ in range(EXP_CONFIG["AGETN_NUM"])]
     else:
         agents = [EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config) for _ in range(EXP_CONFIG["AGETN_NUM"])]
+
+    # ---- Hierarchical Region Communication: build RegionCoordinator ----
+    COMM_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("COMM_CONFIG", {})
+    coordinator = None
+    if COMM_CONFIG.get("ENABLED", False):
+        adj_matrix = build_region_adjacency_matrix(
+            itsx_assignment,
+            proximity_threshold=COMM_CONFIG.get("PROXIMITY_THRESHOLD", 2),
+            include_self_loop=True
+        )
+        state_dim = EXP_CONFIG["ITSX_STATE_DIM"] * len(itsx_assignment[0])
+        coordinator = RegionCoordinator(
+            num_regions=EXP_CONFIG["AGETN_NUM"],
+            state_dim=state_dim,
+            region_adj_matrix=adj_matrix,
+            config=COMM_CONFIG
+        )
+        print(f"[main] RegionCoordinator created ({EXP_CONFIG['AGETN_NUM']} regions, "
+              f"state_dim={state_dim})")
+    else:
+        print("[main] Hierarchical communication disabled (COMM_CONFIG.ENABLED=False)")
+
     print(EXP_CONFIG)
     print(ENV_CONFIG)
 
@@ -164,10 +189,10 @@ def init_exp(args):
         file.write("EXP_CONFIG:\n" + json.dumps(exp_config_serializable, indent=2) + "\n\n")
         file.write("ENV_CONFIG:\n" + json.dumps(ENV_CONFIG, indent=2) + "\n\n")
 
-    return env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG
+    return env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator
 
-def run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
-    logs=pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG)
+def run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
+    logs=pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=coordinator)
     plot_curve(np.array(logs['reward_log']), "Episode Intersection Reward", "Intersection Reward", os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], "plot_intersection_reward.png")) # add
     np.save(os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'],'episode_intersection_reward.npy'),logs['reward_log'])
     plot_curve(np.array(logs['throughput']), "Episode Throughput", "Throughput", os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], "plot_throughput.png")) # add
@@ -180,13 +205,19 @@ def run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
 if __name__ == "__main__":
     print("Is GPU available",tf.test.is_gpu_available())
     args = parse_args()
-    env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG=init_exp(args)
-    run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG)
+    env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=init_exp(args)
+    run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=coordinator)
 
     # add by me
     model_folder = os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], 'models')
     for i, agent in enumerate(agents):
         agent.save_model(os.path.join(model_folder, f"agent_{i}"))
+
+    # Save RegionCoordinator weights if communication was enabled
+    if coordinator is not None:
+        coordinator.save(os.path.join(model_folder, 'region_coordinator'))
+        print(f"[main] RegionCoordinator saved "
+              f"(train_steps={coordinator.train_step_count})")
 
     # for name in dataset_list:
     # main(name)

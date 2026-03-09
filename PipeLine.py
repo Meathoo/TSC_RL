@@ -3,6 +3,7 @@ import numpy as np
 import time
 import json
 from configs import agent_config
+from configs.agent_config import BDQ_AGENT_CONFIG
 
 def assign_state(state,itsx_assignment,itsx_state_dim):
 
@@ -59,17 +60,17 @@ def convert_actions(actions_id,itsx_assignment):
             if itsx != "dummy":
                 decoded_actions[itsx] = int(a) + 1
     return decoded_actions
-def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
+def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
     """
-    Training pipeline that communicate agent with environment
+    Training pipeline that communicates agent with environment.
 
     :param env:
     :param agents:
     :param itsx_assignment:
     :param EXP_CONFIG:
     :param ENV_CONFIG:
+    :param coordinator: RegionCoordinator instance (or None to disable comm)
     :return:
-
     """
     def agent_learn():
         if EXP_CONFIG["TRAINING_PARADIM"] == "CLDE":
@@ -84,6 +85,7 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
     episode_throughput=[]
     episode_queue_length = [] # add
     episode_travel_time=[]
+    comm_train_interval = BDQ_AGENT_CONFIG.get("COMM_CONFIG", {}).get("COMM_TRAIN_INTERVAL", 10)
     """-------------"""
 
     # ---- Training Log (timing + key metrics) ----
@@ -104,8 +106,15 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
             actions_id=[]
             global_step += 1
 
+            # ---- Level 1: Compute inter-region communication context ----
+            comm_context = None  # (num_regions, hidden_dim) or None
+            if coordinator is not None:
+                all_obs = np.stack(obs)
+                comm_context = coordinator.get_context(all_obs, training=True)
+
             for aid,agent in enumerate(agents):
-                action_id=agent.choose_action(obs[aid],idle_branches_id[aid])
+                ctx = comm_context[aid] if comm_context is not None else None
+                action_id=agent.choose_action(obs[aid],idle_branches_id[aid], comm_context=ctx)
                 actions_id.append(action_id)
             joint_actions=convert_actions(actions_id,itsx_assignment)
 
@@ -114,10 +123,22 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
             next_obs = assign_state(next_states,itsx_assignment,EXP_CONFIG["ITSX_STATE_DIM"])
             rewards = assign_reward(itsx_rewards,itsx_assignment)
 
+            # ---- Level 1: Compute next-step communication context ----
+            next_comm_context = None
+            if coordinator is not None:
+                all_next_obs = np.stack(next_obs)
+                next_comm_context = coordinator.get_context(all_next_obs, training=False)
+                coordinator.store(all_next_obs, rewards)
+                if global_step % comm_train_interval == 0:
+                    coordinator.train()
+
             if not done:
                 # only store experience and learn when not finished
                 for aid in range(len(agents)):
-                    agents[aid].store_transition(obs[aid], actions_id[aid], rewards[aid], next_obs[aid])
+                    ctx = comm_context[aid] if comm_context is not None else None
+                    next_ctx = next_comm_context[aid] if next_comm_context is not None else None
+                    agents[aid].store_transition(obs[aid], actions_id[aid], rewards[aid], next_obs[aid],
+                                                 comm_context=ctx, next_comm_context=next_ctx)
                 if global_step % EXP_CONFIG["LEARNING_INTERVAL"] == 0:
                     agent_learn()
                     learn_call_count += 1

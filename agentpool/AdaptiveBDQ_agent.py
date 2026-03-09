@@ -10,28 +10,57 @@ import copy
 tf.config.experimental_run_functions_eagerly(True)
 
 
-def build_network(state_dim, action_dim, sub_action_num):
-    print("build Braching DQ network")
-    state_input = layers.Input(shape=(state_dim,))  # input layer
-    # build shared representation hidden layer
-    shared_representation = layers.Dense(512, activation="relu")(state_input)
-    shared_representation = layers.Dense(256, activation="relu")(shared_representation)
+def build_network(state_dim, action_dim, sub_action_num, comm_context_dim=0):
+    """
+    Build Branching Dueling DQ network.
+
+    Args:
+        state_dim:        Flattened state dimension
+        action_dim:       Number of action branches (intersections in region)
+        sub_action_num:   Number of sub-actions per branch
+        comm_context_dim: Communication context dimension from RegionCoordinator
+                          (0 = no hierarchical communication)
+    """
+    print(f"build Branching DQ network (comm_context_dim={comm_context_dim})")
+    state_input = layers.Input(shape=(state_dim,), name='state_input')
+    model_inputs = [state_input]
+
+    # Optional communication context input (Level 1 → Level 2)
+    if comm_context_dim > 0:
+        context_input = layers.Input(shape=(comm_context_dim,), name='comm_context_input')
+        model_inputs.append(context_input)
+
+    # Level 0 – build shared representation
+    shared_representation = layers.Dense(512, activation="relu", name='encoder_fc1')(state_input)
+    shared_representation = layers.Dense(256, activation="relu", name='encoder_fc2')(shared_representation)
+
+    # Level 2 – fuse communication context (Hierarchical Region Communication)
+    if comm_context_dim > 0:
+        # Project comm context to match shared representation dimension
+        context_processed = layers.Dense(256, activation='relu', name='comm_proj')(context_input)
+        # Gate: learn how much to trust comm vs local info
+        gate_input = layers.Concatenate(name='comm_gate_concat')(
+            [shared_representation, context_processed]
+        )
+        gate = layers.Dense(256, activation='sigmoid', name='comm_gate')(gate_input)
+        shared_representation = gate * shared_representation + (1.0 - gate) * context_processed
+
     # build common state value layer
     common_state_value = layers.Dense(128, activation="relu")(shared_representation)
     common_state_value = layers.Dense(1)(common_state_value)
     # build action branch q value layer iteratively
     subaction_q_layers = []
-    subaction_advantage_layers = []
     for _ in range(action_dim):
         action_branch_layer = layers.Dense(128, activation="relu")(shared_representation)
         action_branch_layer = layers.Dense(sub_action_num)(action_branch_layer)
-        subaction_advantage_layers.append(action_branch_layer)
         subaction_q_value = common_state_value + (action_branch_layer - tf.reduce_mean(action_branch_layer))
-        # subaction_q_value = common_state_value + (action_branch_layer -tf.expand_dims( tf.reduce_mean(action_branch_layer,1),1))
-        # subaction_q_value = common_state_value + (action_branch_layer - tf.maximum(action_branch_layer))
         subaction_q_layers.append(subaction_q_value)
     subaction_q_layers = tf.stack(subaction_q_layers, axis=1)
-    model = tf.keras.Model(state_input, subaction_q_layers)
+
+    if len(model_inputs) > 1:
+        model = tf.keras.Model(model_inputs, subaction_q_layers)
+    else:
+        model = tf.keras.Model(state_input, subaction_q_layers)
     return model
 
 class AdaptiveBDQ_agent:
@@ -43,9 +72,16 @@ class AdaptiveBDQ_agent:
         self.action_dim = env_config["ACTION_DIM"]
         self.subaction_num = env_config["ITSX_ACTION_DIM"]
 
+        # Hierarchical Region Communication config
+        COMM_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("COMM_CONFIG", {})
+        self.use_comm = COMM_CONFIG.get("ENABLED", False)
+        self.comm_context_dim = COMM_CONFIG.get("COMM_HIDDEN_DIM", 64) if self.use_comm else 0
+
         # build model
-        self.eval_model = build_network(self.state_dim, self.action_dim, self.subaction_num)
-        self.target_model = build_network(self.state_dim, self.action_dim, self.subaction_num)
+        self.eval_model = build_network(self.state_dim, self.action_dim, self.subaction_num,
+                                        comm_context_dim=self.comm_context_dim)
+        self.target_model = build_network(self.state_dim, self.action_dim, self.subaction_num,
+                                          comm_context_dim=self.comm_context_dim)
         self.target_model.set_weights(self.eval_model.get_weights())
         AGENT_CONFIG = copy.deepcopy(agent_config.AGENT_CONFIG)
         AGENT_CONFIG.update(agent_config.BDQ_AGENT_CONFIG)
@@ -70,6 +106,10 @@ class AdaptiveBDQ_agent:
         self.action_memory = np.zeros((self.memory_size, self.action_dim))
         self.reward_memory = np.zeros((self.memory_size, 1))
         self.next_state_memory = np.zeros((self.memory_size, self.state_dim))
+        # Communication context memory (Hierarchical Region Communication)
+        if self.use_comm:
+            self.context_memory = np.zeros((self.memory_size, self.comm_context_dim), dtype=np.float32)
+            self.next_context_memory = np.zeros((self.memory_size, self.comm_context_dim), dtype=np.float32)
 
         # target network update setting
         self.replace_target_iter = AGENT_CONFIG["REPLACE_INTERVAL"]
@@ -84,18 +124,30 @@ class AdaptiveBDQ_agent:
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=AGENT_CONFIG["LEARNING_RATE"])
         # print()
 
-    def choose_action(self, state, idle_id=None):
+    def _build_inputs(self, state_tensor, comm_context_tensor=None):
+        """Construct model input(s) depending on whether comm is enabled."""
+        if self.use_comm:
+            if comm_context_tensor is None:
+                B = tf.shape(state_tensor)[0]
+                comm_context_tensor = tf.zeros((B, self.comm_context_dim), dtype=tf.float32)
+            return [state_tensor, comm_context_tensor]
+        return state_tensor
+
+    def choose_action(self, state, idle_id=None, comm_context=None):
         """
-        in dynamic DBQ, some branches are not activated.
-        The idle_id store which branch is not activated
-        for idle branches, the action is replaced by -1.
-        :param state:
-        :param idle_id: a list of idle_branch. the elements in idle_id < self.action_dim
-        :return:
+        Choose action given current state (and optional comm context).
+
+        :param state:        1-D numpy array of shape (state_dim,)
+        :param idle_id:      list of branch indices that are idle (action=-1)
+        :param comm_context: 1-D numpy array (comm_context_dim,) from RegionCoordinator
+        :return: numpy array of joint actions
         """
-        # print()
-        state = state[np.newaxis, :]
-        action_branch_value = self.eval_model(state)[0]
+        state = state[np.newaxis, :]  # (1, state_dim)
+        ctx = None
+        if self.use_comm and comm_context is not None:
+            ctx = tf.convert_to_tensor(comm_context[np.newaxis, :], dtype=tf.float32)
+        inputs = self._build_inputs(tf.convert_to_tensor(state, dtype=tf.float32), ctx)
+        action_branch_value = self.eval_model(inputs)[0]
         joint_action = []
         if np.random.random() > self.epsilon:
             # greedy choice
@@ -126,9 +178,16 @@ class AdaptiveBDQ_agent:
             r = tf.convert_to_tensor(self.reward_memory[batch_indices], dtype=tf.float32)
             s_ = tf.convert_to_tensor(self.next_state_memory[batch_indices], dtype=tf.float32)
 
+            # Extract communication context from replay buffer (if enabled)
+            ctx = None
+            next_ctx = None
+            if self.use_comm:
+                ctx = tf.convert_to_tensor(self.context_memory[batch_indices], dtype=tf.float32)
+                next_ctx = tf.convert_to_tensor(self.next_context_memory[batch_indices], dtype=tf.float32)
+
             # 呼叫 update_gradient (這裡傳入全 1 的權重，因為不使用 PER)
             is_weights = tf.ones(self.batch_size, dtype=tf.float32)
-            self.update_gradient(s, a, r, s_, is_weights)
+            self.update_gradient(s, a, r, s_, is_weights, ctx, next_ctx)
 
             # 目標網路更新
             if self.replace_count % self.replace_target_iter == 0:
@@ -146,24 +205,36 @@ class AdaptiveBDQ_agent:
             a.assign(a * (1 - self.tau) + b * self.tau)
 
     @tf.function
-    def update_gradient(self, s, a, r, s_, is_weights):
+    def update_gradient(self, s, a, r, s_, is_weights,
+                        comm_ctx=None, next_comm_ctx=None):
+        """
+        Compute and apply gradients.
+
+        comm_ctx / next_comm_ctx: optional (batch, comm_context_dim) tensors
+        from RegionCoordinator; used when hierarchical communication is enabled.
+        """
         with tf.GradientTape() as tape:
+            # Build model inputs (with optional comm context)
+            eval_inputs = self._build_inputs(s, comm_ctx)
+            next_inputs_eval = self._build_inputs(s_, next_comm_ctx)
+            next_inputs_target = self._build_inputs(s_, next_comm_ctx)
+
             # 1. 取得 Eval 網路輸出，指定 training=True
-            q_eval = self.eval_model(s, training=True)
+            q_eval = self.eval_model(eval_inputs, training=True)
             
-            # 2. 構建 Mask (這部分參考 bk 的邏輯)
+            # 2. 構建 Mask
             eval_act_index = tf.cast(a, tf.int32)
             eval_act_index_mask = tf.one_hot(eval_act_index, self.subaction_num)
             
             # 處理閒置分支 (Idle branches)
             idle_mask = tf.where(eval_act_index == -1, 0.0, 1.0)
 
-            # 3. 計算 Target Q (Double DQN 邏輯)
-            q_next_eval = self.eval_model(s_, training=False) 
+            # 3. 計算 Target Q (Double DQN)
+            q_next_eval = self.eval_model(next_inputs_eval, training=False)
             greedy_next_action = tf.argmax(q_next_eval, axis=2)
             greedy_next_action_mask = tf.one_hot(greedy_next_action, self.subaction_num)
 
-            q_target_s_next = self.target_model(s_, training=False)
+            q_target_s_next = self.target_model(next_inputs_target, training=False)
             masked_q_target_s_next = tf.multiply(q_target_s_next, greedy_next_action_mask)
             
             # 根據 TD 算子類型計算 V(s')
@@ -197,12 +268,25 @@ class AdaptiveBDQ_agent:
         gradients = tape.gradient(loss, self.eval_model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.eval_model.trainable_variables))
 
-    def store_transition(self, s, a, r, s_):
-        index = self.memory_counter % self.memory_size  # store transition at position ,first coming first replaced.
+    def store_transition(self, s, a, r, s_, comm_context=None, next_comm_context=None):
+        """
+        Store a transition.  comm_context / next_comm_context are optional numpy
+        arrays of shape (comm_context_dim,) from RegionCoordinator.
+        """
+        index = self.memory_counter % self.memory_size
         self.state_memory[index] = s
         self.action_memory[index] = a
         self.reward_memory[index] = r
         self.next_state_memory[index] = s_
+        if self.use_comm:
+            self.context_memory[index] = (
+                comm_context if comm_context is not None
+                else np.zeros(self.comm_context_dim, dtype=np.float32)
+            )
+            self.next_context_memory[index] = (
+                next_comm_context if next_comm_context is not None
+                else np.zeros(self.comm_context_dim, dtype=np.float32)
+            )
         self.memory_counter += 1
 
 
