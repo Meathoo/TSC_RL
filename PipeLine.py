@@ -91,6 +91,54 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
     episode_logs = []  # per-episode detailed log
     learn_call_count = 0  # total learn() calls across all agents
 
+    # ---- Contrastive Pre-training Phase ----
+    CL_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("CONTRASTIVE_CONFIG", {})
+    use_contrastive = CL_CONFIG.get("ENABLED", False)
+    collect_episodes = CL_CONFIG.get("COLLECT_EPISODES", 0)
+    if use_contrastive and collect_episodes > 0:
+        obs_buffer = []
+        print(f"[Contrastive] Collecting observations: {collect_episodes} episodes with random policy...")
+        for ep in range(collect_episodes):
+            state = env.reset()
+            obs = assign_state(state, itsx_assignment, EXP_CONFIG["ITSX_STATE_DIM"])
+            obs_buffer.extend(obs)
+            
+            done = False
+            step_count = 0
+            while not done and step_count < int(ENV_CONFIG["SIM_TIMESPAN"]/ENV_CONFIG["ACTION_INTERVAL"]):
+                # Random policy for data collection
+                actions_id = []
+                for aid, agent in enumerate(agents):
+                    # Random action selection
+                    random_action = np.random.randint(0, agent.subaction_num, size=agent.action_dim)
+                    # Handle idle branches
+                    for idle_id in idle_branches_id[aid]:
+                        random_action[idle_id] = -1
+                    actions_id.append(random_action)
+                
+                joint_actions = convert_actions(actions_id, itsx_assignment)
+                next_states, _, done, _ = env.step(joint_actions)
+                next_obs = assign_state(next_states, itsx_assignment, EXP_CONFIG["ITSX_STATE_DIM"])
+                obs_buffer.extend(next_obs)
+                step_count += 1
+            
+            if (ep + 1) % 5 == 0:
+                print(f"  Collected episode {ep+1}/{collect_episodes}, buffer: {len(obs_buffer)}")
+        
+        obs_buffer = np.array(obs_buffer, dtype=np.float32)
+        print(f"[Contrastive] Total observations: {obs_buffer.shape[0]}")
+        
+        # Run contrastive pre-training
+        if EXP_CONFIG["TRAINING_PARADIM"] == "CLDE":
+            # Centralized training: only train first agent
+            agents[0].pretrain_contrastive(obs_buffer)
+        else:
+            # Decentralized: each agent trains on all observations
+            for agent in agents:
+                agent.pretrain_contrastive(obs_buffer)
+        
+        print("[Contrastive] Pre-training phase completed\n")
+
     for episode in range(EXP_CONFIG["EPISODE"]):
         state=env.reset()
         obs=assign_state(state,itsx_assignment,EXP_CONFIG["ITSX_STATE_DIM"])

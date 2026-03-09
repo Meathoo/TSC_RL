@@ -13,9 +13,9 @@ tf.config.experimental_run_functions_eagerly(True)
 def build_network(state_dim, action_dim, sub_action_num):
     print("build Braching DQ network")
     state_input = layers.Input(shape=(state_dim,))  # input layer
-    # build shared representation hidden layer
-    shared_representation = layers.Dense(512, activation="relu")(state_input)
-    shared_representation = layers.Dense(256, activation="relu")(shared_representation)
+    # build shared representation hidden layer (named for contrastive pre-training access)
+    shared_representation = layers.Dense(512, activation="relu", name='encoder_fc1')(state_input)
+    shared_representation = layers.Dense(256, activation="relu", name='encoder_fc2')(shared_representation)
     # build common state value layer
     common_state_value = layers.Dense(128, activation="relu")(shared_representation)
     common_state_value = layers.Dense(1)(common_state_value)
@@ -61,6 +61,20 @@ class AdaptiveBDQ_agent:
         self.gamma = AGENT_CONFIG["GAMMA"]
         self.learn_count = 0
 
+        # Contrastive Pre-training config
+        CL_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("CONTRASTIVE_CONFIG", {})
+        self.use_contrastive = CL_CONFIG.get("ENABLED", False)
+        self.cl_aux_weight = CL_CONFIG.get("AUX_LOSS_WEIGHT", 0.0)
+        self.use_contrastive_aux = self.use_contrastive and self.cl_aux_weight > 0
+        if self.use_contrastive_aux:
+            self.cl_noise_std = CL_CONFIG.get("NOISE_STD", 0.1)
+            self.cl_mask_ratio = CL_CONFIG.get("MASK_RATIO", 0.15)
+            self._last_cl_loss = 0.0
+
+        # Cache encoder layer references for contrastive auxiliary loss
+        if self.use_contrastive_aux:
+            self._encoder_fc1 = self.eval_model.get_layer('encoder_fc1')
+            self._encoder_fc2 = self.eval_model.get_layer('encoder_fc2')
 
         # memory replay
         self.memory_counter = 0
@@ -189,13 +203,58 @@ class AdaptiveBDQ_agent:
             
             # 計算 MSE Loss
             td_errors = target_val - q_eval_selected
-            loss = tf.reduce_mean(tf.square(td_errors)) 
+            loss = tf.reduce_mean(tf.square(td_errors))
+
+            # Contrastive auxiliary loss (representation consistency regularization)
+            if self.use_contrastive_aux:
+                aug_s = s + tf.random.normal(tf.shape(s), stddev=self.cl_noise_std)
+                keep_mask = tf.cast(
+                    tf.random.uniform(tf.shape(s)) > self.cl_mask_ratio, tf.float32)
+                aug_s = aug_s * keep_mask / tf.maximum(1.0 - self.cl_mask_ratio, 1e-6)
+                z_orig = self._encode(s)
+                z_aug = self._encode(aug_s)
+                z_orig_n = tf.math.l2_normalize(z_orig, axis=-1)
+                z_aug_n = tf.math.l2_normalize(z_aug, axis=-1)
+                cl_loss = tf.reduce_mean(
+                    1.0 - tf.reduce_sum(z_orig_n * z_aug_n, axis=-1))
+                loss = loss + self.cl_aux_weight * cl_loss
+                self._last_cl_loss = cl_loss.numpy()
             
             self.loss_his.append(loss.numpy())
 
         # 5. 套用梯度 (不使用裁剪)
         gradients = tape.gradient(loss, self.eval_model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.eval_model.trainable_variables))
+
+    def _encode(self, s):
+        """Forward state through shared encoder layers (for contrastive auxiliary loss)."""
+        return self._encoder_fc2(self._encoder_fc1(s))
+
+    def pretrain_contrastive(self, obs_buffer):
+        """
+        Run contrastive pre-training on collected observations.
+        Called by Pipeline before RL training starts.
+
+        Args:
+            obs_buffer: np.ndarray (N, state_dim) — observations collected via random policy
+        """
+        from agentpool.contrastive_pretrain import ContrastivePretrainer
+
+        CL_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("CONTRASTIVE_CONFIG", {})
+        pretrainer = ContrastivePretrainer(
+            eval_model=self.eval_model,
+            state_dim=self.state_dim,
+            config=CL_CONFIG,
+            itsx_state_dim=self.state_dim // self.action_dim,
+        )
+        pretrainer.pretrain(obs_buffer)
+
+        # Save pre-training loss history for analysis
+        self.cl_pretrain_losses = pretrainer.loss_history
+
+        # Sync target model with pre-trained encoder weights
+        self.target_model.set_weights(self.eval_model.get_weights())
+        print("  [Contrastive] Target model synced with pre-trained weights")
 
     def store_transition(self, s, a, r, s_):
         index = self.memory_counter % self.memory_size  # store transition at position ,first coming first replaced.
@@ -217,4 +276,9 @@ class AdaptiveBDQ_agent:
         """
         # save critic model
         self.eval_model.save(os.path.join(model_folder, "eval_model.h5"))
+        
+        # save contrastive pre-training loss history
+        if hasattr(self, 'cl_pretrain_losses') and len(self.cl_pretrain_losses) > 0:
+            np.save(os.path.join(model_folder, "contrastive_pretrain_loss.npy"),
+                    np.array(self.cl_pretrain_losses))
 
