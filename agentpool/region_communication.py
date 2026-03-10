@@ -213,18 +213,7 @@ class InterRegionCommunication(layers.Layer):
         ], name='message_decoder')
 
     def call(self, region_features, region_adj_matrix, training=None):
-        """
-        Run multi-round GAT message passing between regions.
-
-        Args:
-            region_features:   (batch, num_regions, feat_dim)
-            region_adj_matrix: (num_regions, num_regions) float32
-            training: bool
-
-        Returns:
-            context_vectors: (batch, num_regions, hidden_dim)
-        """
-        messages = self.msg_encoder(region_features)  # (B, N, message_dim)
+        messages = self.msg_encoder(region_features)
 
         for r in range(self.num_rounds):
             neighbor_agg = self.gat_layers[r](
@@ -235,12 +224,112 @@ class InterRegionCommunication(layers.Layer):
             neighbor_agg = self.dropout_layers[r](neighbor_agg, training=training)
 
             gate_input = tf.concat([messages, neighbor_agg], axis=-1)
-            gate = self.gate_layers[r](gate_input)          # (B, N, message_dim)
-            update = self.update_layers[r](neighbor_agg)    # (B, N, message_dim)
+            gate = self.gate_layers[r](gate_input)
+            update = self.update_layers[r](neighbor_agg)
             messages = self.norm_layers[r](gate * update + (1.0 - gate) * messages)
 
-        context = self.msg_decoder(messages)  # (B, N, hidden_dim)
+        context = self.msg_decoder(messages)
         return context
+
+
+# ============================================================================
+#  MeanField Communication Layer  (lightweight alternative to GAT)
+# ============================================================================
+
+class MeanFieldCommunication(layers.Layer):
+    """
+    Lightweight inter-region communication via mean-field aggregation.
+
+    Instead of attention-weighted aggregation (GAT), each region simply
+    averages its neighbours' features using the adjacency matrix.
+    Much faster than GAT while preserving the inter-region information flow.
+
+    Per round:
+      neighbour_agg_i = (1/|N(i)|) * Σ_{j∈N(i)} W_agg · h_j
+      gate = σ(W_gate · [h_i; neighbour_agg_i])
+      h_i' = LayerNorm( gate * W_update(neighbour_agg_i) + (1-gate) * h_i )
+
+    Args:
+        message_dim:  Dimension of inter-region messages
+        hidden_dim:   Output context vector dimension
+        num_rounds:   Communication rounds (multi-hop propagation)
+    """
+
+    def __init__(self, message_dim=32, hidden_dim=64, num_rounds=2, **kwargs):
+        super().__init__(**kwargs)
+        self.message_dim = message_dim
+        self.hidden_dim = hidden_dim
+        self.num_rounds = num_rounds
+
+        # Message encoder
+        self.msg_encoder = tf.keras.Sequential([
+            layers.Dense(hidden_dim, activation='relu', name='mf_enc1'),
+            layers.Dense(message_dim, activation='tanh', name='mf_enc2')
+        ], name='mf_encoder')
+
+        # Per-round layers
+        self.agg_layers = []
+        self.gate_layers = []
+        self.update_layers = []
+        self.norm_layers = []
+
+        for r in range(num_rounds):
+            self.agg_layers.append(
+                layers.Dense(message_dim, activation='relu',
+                             name=f'mf_agg_round_{r}')
+            )
+            self.gate_layers.append(
+                layers.Dense(message_dim, activation='sigmoid',
+                             name=f'mf_gate_round_{r}')
+            )
+            self.update_layers.append(
+                layers.Dense(message_dim, activation='relu',
+                             name=f'mf_update_round_{r}')
+            )
+            self.norm_layers.append(
+                layers.LayerNormalization(name=f'mf_norm_round_{r}')
+            )
+
+        # Message decoder
+        self.msg_decoder = tf.keras.Sequential([
+            layers.Dense(hidden_dim, activation='relu', name='mf_dec1'),
+            layers.Dense(hidden_dim, name='mf_dec2')
+        ], name='mf_decoder')
+
+        # Precomputed row-normalized adjacency (set in build or externally)
+        self._adj_norm = None
+
+    def _get_adj_norm(self, adj_matrix):
+        """Row-normalize adjacency (with self-loop) for mean aggregation."""
+        if self._adj_norm is None:
+            adj = tf.cast(adj_matrix, tf.float32)
+            deg = tf.reduce_sum(adj, axis=-1, keepdims=True)  # (N, 1)
+            self._adj_norm = adj / tf.maximum(deg, 1e-6)      # (N, N)
+        return self._adj_norm
+
+    def call(self, region_features, region_adj_matrix, training=None):
+        """
+        Args:
+            region_features:   (batch, N, feat_dim)
+            region_adj_matrix: (N, N) float32
+        Returns:
+            context_vectors:   (batch, N, hidden_dim)
+        """
+        adj_norm = self._get_adj_norm(region_adj_matrix)  # (N, N)
+        messages = self.msg_encoder(region_features)       # (B, N, D)
+
+        for r in range(self.num_rounds):
+            # Mean-field aggregation: matmul with row-normalized adjacency
+            # adj_norm: (N, N) → (1, N, N), messages: (B, N, D) → (B, N, D)
+            neighbor_mean = tf.matmul(adj_norm[tf.newaxis], messages)
+            neighbor_agg = self.agg_layers[r](neighbor_mean)
+
+            gate_input = tf.concat([messages, neighbor_agg], axis=-1)
+            gate = self.gate_layers[r](gate_input)
+            update = self.update_layers[r](neighbor_agg)
+            messages = self.norm_layers[r](gate * update + (1.0 - gate) * messages)
+
+        return self.msg_decoder(messages)
 
 
 # ============================================================================
@@ -350,6 +439,7 @@ class RegionCoordinator:
         self.region_adj_matrix = tf.constant(region_adj_matrix, dtype=tf.float32)
 
         # Hyperparameters
+        self.comm_type = config.get("COMM_TYPE", "MEANFIELD").upper()
         self.message_dim = config.get("COMM_MESSAGE_DIM", 32)
         self.hidden_dim = config.get("COMM_HIDDEN_DIM", 64)
         self.num_heads = config.get("COMM_NUM_HEADS", 4)
@@ -367,14 +457,21 @@ class RegionCoordinator:
             layers.Dense(self.hidden_dim, activation='relu', name='coord_enc_dense2')
         ], name='region_state_encoder')
 
-        # Communication module (State encoder output → context vectors)
-        self.comm_module = InterRegionCommunication(
-            message_dim=self.message_dim,
-            hidden_dim=self.hidden_dim,
-            num_heads=self.num_heads,
-            num_rounds=self.num_rounds,
-            dropout_rate=self.dropout_rate
-        )
+        # Communication module — choose between GAT and MeanField
+        if self.comm_type == "GAT":
+            self.comm_module = InterRegionCommunication(
+                message_dim=self.message_dim,
+                hidden_dim=self.hidden_dim,
+                num_heads=self.num_heads,
+                num_rounds=self.num_rounds,
+                dropout_rate=self.dropout_rate
+            )
+        else:  # MEANFIELD (default)
+            self.comm_module = MeanFieldCommunication(
+                message_dim=self.message_dim,
+                hidden_dim=self.hidden_dim,
+                num_rounds=self.num_rounds,
+            )
 
         # Self-supervised heads
         # Task 1: predict own reward from comm context
@@ -426,9 +523,13 @@ class RegionCoordinator:
         self.e2e_ptr = 0
         self.e2e_count = 0
 
+        # ---- Context cache (avoids redundant recomputation in DECENTRAL) ----
+        self._ctx_cache_key = None     # hashable key for current cached batch
+        self._ctx_cache_val = None     # cached (context_tf, next_context_tf)
+
         print(f"[RegionCoordinator] Initialized: {num_regions} regions, "
-              f"msg_dim={self.message_dim}, hidden={self.hidden_dim}, "
-              f"heads={self.num_heads}, rounds={self.num_rounds}")
+              f"type={self.comm_type}, msg_dim={self.message_dim}, "
+              f"hidden={self.hidden_dim}, rounds={self.num_rounds}")
         print(f"[RegionCoordinator] adj_matrix:\n{region_adj_matrix}")
 
     # ------------------------------------------------------------------
@@ -461,6 +562,35 @@ class RegionCoordinator:
         features = self.state_encoder(all_obs_tf, training=training)
         context = self.comm_module(features, self.region_adj_matrix, training=training)
         return context
+
+    def compute_context_cached(self, all_obs_batch, all_next_obs_batch, training=True):
+        """
+        Compute (context, next_context) with caching.
+
+        Multiple agents in DECENTRAL mode share the same coordinator.
+        If they sample the same step indices, this avoids recomputing.
+        Uses a simple hash of the obs pointer to detect cache hits.
+
+        Returns:
+            (context_tf, next_context_tf): both (batch, num_regions, hidden_dim)
+        """
+        cache_key = (id(all_obs_batch), all_obs_batch.shape, all_obs_batch.ctypes.data)
+        if self._ctx_cache_key == cache_key and self._ctx_cache_val is not None:
+            return self._ctx_cache_val
+
+        all_obs_tf = tf.convert_to_tensor(all_obs_batch, dtype=tf.float32)
+        all_next_obs_tf = tf.convert_to_tensor(all_next_obs_batch, dtype=tf.float32)
+        context = self.compute_context_tf(all_obs_tf, training=training)
+        next_context = self.compute_context_tf(all_next_obs_tf, training=False)
+
+        self._ctx_cache_key = cache_key
+        self._ctx_cache_val = (context, next_context)
+        return context, next_context
+
+    def invalidate_cache(self):
+        """Clear the context cache (call after optimizer step)."""
+        self._ctx_cache_key = None
+        self._ctx_cache_val = None
 
     def get_comm_trainable_variables(self):
         """Return trainable variables of state_encoder + comm_module."""

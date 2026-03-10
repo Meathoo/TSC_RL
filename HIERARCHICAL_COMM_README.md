@@ -1,8 +1,15 @@
 # Hierarchical Region Communication
 
-**Graph Attention Network (GAT) 跨區域通訊模組**
+**跨區域通訊模組 — GAT / MeanField**
 
-為 RegionLight 交通號誌控制系統實現的層級式區域通訊機制。透過 GAT 讓相鄰區域的 agent 交換壓縮訊息，實現跨區域協調決策。
+為 RegionLight 交通號誌控制系統實現的層級式區域通訊機制。支援兩種通訊方式：
+
+| 模式 | 說明 | 速度 |
+|------|------|------|
+| **MeanField** (預設) | 以鄰接矩陣做加權平均聚合，無 attention | 快 (5-10×) |
+| **GAT** | Multi-head Graph Attention Network | 慢 |
+
+透過 `COMM_CONFIG["COMM_TYPE"]` 切換：`"MEANFIELD"` 或 `"GAT"`。
 
 ---
 
@@ -33,8 +40,8 @@
 │  Level 2 — Decision (融合決策)                                      │
 │    gate * local_repr + (1-gate) * comm_context → Q-values           │
 ├─────────────────────────────────────────────────────────────────────┤
-│  Level 1 — Inter-Region (GAT 通訊)                                  │
-│    State Encoder → Message Encoder → GAT × 2 rounds → Decoder      │
+│  Level 1 — Inter-Region (GAT / MeanField 通訊)                      │
+│    State Encoder → Message Encoder → Aggregation × N rounds → Decoder │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Level 0 — Intra-Region (區域內)                                    │
 │    state_input → encoder_fc1(512) → encoder_fc2(256) → shared_repr  │
@@ -380,7 +387,7 @@ Step 4: End-to-End 訓練 (每 LEARNING_INTERVAL 步)
     │  Q(s,a) = eval_model([state, comm_ctx])                      │
     │  TD_loss = (r + γ·Q_target(s') − Q(s,a))²                    │
     └───────────────────────────────────────────────────────────────┘
-    gradients → eval_model + state_encoder + GAT comm_module
+    gradients → eval_model + state_encoder + comm_module (GAT or MeanField)
 
 Step 5: 自監督輔助訓練 (每 10 步)
     RegionCoordinator.train(obs_batch, reward_batch)
@@ -396,11 +403,12 @@ Step 5: 自監督輔助訓練 (每 10 步)
 ```python
 "COMM_CONFIG": {
     "ENABLED": False,               # 是否啟用跨區域通訊
+    "COMM_TYPE": "MEANFIELD",       # "MEANFIELD" (快速) 或 "GAT" (注意力)
     "COMM_MESSAGE_DIM": 32,         # 區域間訊息壓縮維度
     "COMM_HIDDEN_DIM": 64,          # context 向量維度 (也是 State Encoder 輸出維度)
-    "COMM_NUM_HEADS": 4,            # GAT 注意力頭數
+    "COMM_NUM_HEADS": 4,            # GAT 注意力頭數 (僅 COMM_TYPE="GAT" 時使用)
     "COMM_NUM_ROUNDS": 2,           # 通訊輪次 (multi-hop 傳播距離)
-    "COMM_DROPOUT_RATE": 0.1,       # GAT attention dropout
+    "COMM_DROPOUT_RATE": 0.1,       # GAT attention dropout (僅 GAT)
     "COMM_LEARNING_RATE": 0.0001,   # 通訊模組 Adam 學習率
     "PROXIMITY_THRESHOLD": 2,       # 區域鄰接的曼哈頓距離閾值
     # --- 自監督訓練 ---
@@ -410,6 +418,16 @@ Step 5: 自監督輔助訓練 (每 10 步)
     "COMM_BUFFER_SIZE": 50000,      # replay buffer 容量
 }
 ```
+
+### MeanField vs GAT
+
+| 項目 | MeanField | GAT |
+|------|-----------|-----|
+| 聚合方式 | 鄰接矩陣正規化 × matmul | Multi-head attention (einsum) |
+| 每輪計算量 | O(N²·D) — 一次矩陣乘法 | O(N²·D·H) — attention + softmax |
+| 可學習參數 | Dense(agg) + Dense(gate) + Dense(update) | W_Q, W_K, W_V × H heads + a_left, a_right |
+| 額外開銷 | 無 Dropout, 無 Softmax | Dropout + Masked Softmax |
+| 推薦場景 | 大規模 grid (6×6+)，快速實驗 | 鄰接結構不對稱，需要自適應權重 |
 
 ### 參數量開銷（Hangzhou 4×4）
 
@@ -432,9 +450,10 @@ Step 5: 自監督輔助訓練 (每 10 步)
 agentpool/
 ├── region_communication.py          # Level 1 完整實作
 │   ├── RegionGATLayer               # GAT 注意力層
-│   ├── InterRegionCommunication     # Message Encoder + GAT rounds + Decoder
+│   ├── InterRegionCommunication     # GAT: Message Encoder + GAT rounds + Decoder
+│   ├── MeanFieldCommunication       # MeanField: 鄰接平均聚合 (輕量替代 GAT)
 │   ├── build_region_adjacency_matrix # 鄰接矩陣建構
-│   └── RegionCoordinator            # 統籌通訊 + 自監督訓練
+│   └── RegionCoordinator            # 統籌通訊 + 自監督訓練 + context 快取
 │
 ├── AdaptiveBDQ_agent.py             # Level 0 + Level 2
 │   ├── build_network()              # 包含 comm context 融合 gate

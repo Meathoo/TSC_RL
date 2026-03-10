@@ -78,6 +78,7 @@ class AdaptiveBDQ_agent:
         COMM_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("COMM_CONFIG", {})
         self.use_comm = COMM_CONFIG.get("ENABLED", False)
         self.comm_context_dim = COMM_CONFIG.get("COMM_HIDDEN_DIM", 64) if self.use_comm else 0
+        self.e2e_freq = COMM_CONFIG.get("E2E_FREQ", 1)  # only do E2E backward every N learn steps
 
         # End-to-end: reference to shared coordinator and this agent's region index
         self.coordinator = coordinator if self.use_comm else None
@@ -195,10 +196,12 @@ class AdaptiveBDQ_agent:
 
             # 呼叫 update_gradient (這裡傳入全 1 的權重，因為不使用 PER)
             is_weights = tf.ones(self.batch_size, dtype=tf.float32)
+            do_e2e = (self.learn_count % self.e2e_freq == 0)
             self.update_gradient(s, a, r, s_, is_weights,
                                 all_obs_batch=all_obs_batch,
                                 all_next_obs_batch=all_next_obs_batch,
-                                region_ids=region_ids)
+                                region_ids=region_ids,
+                                e2e=do_e2e)
 
             # 目標網路更新
             if self.replace_count % self.replace_target_iter == 0:
@@ -217,43 +220,67 @@ class AdaptiveBDQ_agent:
 
     def update_gradient(self, s, a, r, s_, is_weights,
                         all_obs_batch=None, all_next_obs_batch=None,
-                        region_ids=None):
+                        region_ids=None, e2e=True):
         """
         Compute and apply gradients with end-to-end communication.
 
         When comm is enabled, context is recomputed from all_obs within the
         GradientTape so that TD loss gradients flow back to the coordinator's
-        state_encoder and GAT communication module.
+        state_encoder and communication module (GAT or MeanField).
+        Uses context caching to avoid redundant computation in DECENTRAL mode.
+
+        Args:
+            e2e: If True, compute context inside tape (full E2E gradient).
+                 If False, compute context outside tape (frozen, faster).
         """
         # Determine trainable variables (BDQ + coordinator if end-to-end)
         train_vars = list(self.eval_model.trainable_variables)
-        if self.use_comm and self.coordinator is not None:
+        if self.use_comm and self.coordinator is not None and e2e:
             train_vars += self.coordinator.get_comm_trainable_variables()
 
+        # Pre-compute frozen context when not doing E2E
+        comm_ctx_frozen = None
+        next_comm_ctx_frozen = None
+        if (self.use_comm and self.coordinator is not None
+                and all_obs_batch is not None and not e2e):
+            all_obs_tf = tf.convert_to_tensor(all_obs_batch, dtype=tf.float32)
+            all_next_obs_tf = tf.convert_to_tensor(all_next_obs_batch, dtype=tf.float32)
+            all_context = tf.stop_gradient(
+                self.coordinator.compute_context_tf(all_obs_tf, training=False))
+            next_all_context = tf.stop_gradient(
+                self.coordinator.compute_context_tf(all_next_obs_tf, training=False))
+            batch_idx = tf.range(tf.shape(all_context)[0])
+            region_ids_tf = tf.cast(tf.convert_to_tensor(region_ids), tf.int32)
+            indices = tf.stack([batch_idx, region_ids_tf], axis=1)
+            comm_ctx_frozen = tf.gather_nd(all_context, indices)
+            next_comm_ctx_frozen = tf.gather_nd(next_all_context, indices)
+
         with tf.GradientTape() as tape:
-            # ---- End-to-End: recompute comm context inside tape ----
+            # ---- Compute comm context ----
             comm_ctx = None
             next_comm_ctx = None
-            if (self.use_comm and self.coordinator is not None
-                    and all_obs_batch is not None):
-                all_obs_tf = tf.convert_to_tensor(all_obs_batch, dtype=tf.float32)
-                all_context = self.coordinator.compute_context_tf(
-                    all_obs_tf, training=True)
-                # Extract this region's context: (batch, hidden_dim)
-                batch_idx = tf.range(tf.shape(all_context)[0])
-                region_ids_tf = tf.cast(
-                    tf.convert_to_tensor(region_ids), tf.int32)
-                indices = tf.stack([batch_idx, region_ids_tf], axis=1)
-                comm_ctx = tf.gather_nd(all_context, indices)
+            if self.use_comm and self.coordinator is not None and all_obs_batch is not None:
+                if e2e:
+                    # Full E2E: recompute inside tape for gradient flow
+                    all_obs_tf = tf.convert_to_tensor(all_obs_batch, dtype=tf.float32)
+                    all_context = self.coordinator.compute_context_tf(
+                        all_obs_tf, training=True)
+                    batch_idx = tf.range(tf.shape(all_context)[0])
+                    region_ids_tf = tf.cast(
+                        tf.convert_to_tensor(region_ids), tf.int32)
+                    indices = tf.stack([batch_idx, region_ids_tf], axis=1)
+                    comm_ctx = tf.gather_nd(all_context, indices)
 
-                # Next-state context (stop gradient — target should not
-                # provide gradient signal, same as standard DQN)
-                all_next_obs_tf = tf.convert_to_tensor(
-                    all_next_obs_batch, dtype=tf.float32)
-                next_all_context = self.coordinator.compute_context_tf(
-                    all_next_obs_tf, training=False)
-                next_comm_ctx = tf.stop_gradient(
-                    tf.gather_nd(next_all_context, indices))
+                    all_next_obs_tf = tf.convert_to_tensor(
+                        all_next_obs_batch, dtype=tf.float32)
+                    next_all_context = self.coordinator.compute_context_tf(
+                        all_next_obs_tf, training=False)
+                    next_comm_ctx = tf.stop_gradient(
+                        tf.gather_nd(next_all_context, indices))
+                else:
+                    # Frozen context (pre-computed outside tape)
+                    comm_ctx = comm_ctx_frozen
+                    next_comm_ctx = next_comm_ctx_frozen
 
             # Build model inputs (with fresh, differentiable comm context)
             eval_inputs = self._build_inputs(s, comm_ctx)
@@ -312,6 +339,10 @@ class AdaptiveBDQ_agent:
         if grads_and_vars:
             g_list, v_list = zip(*grads_and_vars)
             self.optimizer.apply_gradients(zip(g_list, v_list))
+
+        # Invalidate coordinator cache after weights change
+        if self.use_comm and self.coordinator is not None:
+            self.coordinator.invalidate_cache()
 
     def store_transition(self, s, a, r, s_, step_idx=-1, region_id=None):
         """
