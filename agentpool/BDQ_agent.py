@@ -39,6 +39,7 @@ def build_network(state_dim, action_dim, sub_action_num):
 class BrachingDQ_agent:
     def __init__(self,
                  env_config,
+                 **kwargs
                  ):
 
         self.state_dim = env_config["ITSX_STATE_DIM"] * env_config["ACTION_DIM"]

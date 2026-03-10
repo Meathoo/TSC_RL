@@ -129,16 +129,17 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
                 all_next_obs = np.stack(next_obs)
                 next_comm_context = coordinator.get_context(all_next_obs, training=False)
                 coordinator.store(all_next_obs, rewards)
+                # End-to-end: store all_obs/all_next_obs in shared buffer
+                step_idx = coordinator.store_step(np.stack(obs), all_next_obs)
                 if global_step % comm_train_interval == 0:
                     coordinator.train()
 
             if not done:
                 # only store experience and learn when not finished
                 for aid in range(len(agents)):
-                    ctx = comm_context[aid] if comm_context is not None else None
-                    next_ctx = next_comm_context[aid] if next_comm_context is not None else None
                     agents[aid].store_transition(obs[aid], actions_id[aid], rewards[aid], next_obs[aid],
-                                                 comm_context=ctx, next_comm_context=next_ctx)
+                                                 step_idx=step_idx if coordinator is not None else -1,
+                                                 region_id=aid)
                 if global_step % EXP_CONFIG["LEARNING_INTERVAL"] == 0:
                     agent_learn()
                     learn_call_count += 1

@@ -65,7 +65,9 @@ def build_network(state_dim, action_dim, sub_action_num, comm_context_dim=0):
 
 class AdaptiveBDQ_agent:
     def __init__(self,
-                 env_config
+                 env_config,
+                 coordinator=None,
+                 region_id=0
                  ):
 
         self.state_dim = env_config["ITSX_STATE_DIM"] * env_config["ACTION_DIM"]
@@ -76,6 +78,10 @@ class AdaptiveBDQ_agent:
         COMM_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("COMM_CONFIG", {})
         self.use_comm = COMM_CONFIG.get("ENABLED", False)
         self.comm_context_dim = COMM_CONFIG.get("COMM_HIDDEN_DIM", 64) if self.use_comm else 0
+
+        # End-to-end: reference to shared coordinator and this agent's region index
+        self.coordinator = coordinator if self.use_comm else None
+        self.region_id = region_id
 
         # build model
         self.eval_model = build_network(self.state_dim, self.action_dim, self.subaction_num,
@@ -106,10 +112,10 @@ class AdaptiveBDQ_agent:
         self.action_memory = np.zeros((self.memory_size, self.action_dim))
         self.reward_memory = np.zeros((self.memory_size, 1))
         self.next_state_memory = np.zeros((self.memory_size, self.state_dim))
-        # Communication context memory (Hierarchical Region Communication)
+        # End-to-end: store step index into coordinator's shared observation buffer
         if self.use_comm:
-            self.context_memory = np.zeros((self.memory_size, self.comm_context_dim), dtype=np.float32)
-            self.next_context_memory = np.zeros((self.memory_size, self.comm_context_dim), dtype=np.float32)
+            self.step_idx_memory = np.full((self.memory_size,), -1, dtype=np.int64)
+            self.region_id_memory = np.full((self.memory_size,), self.region_id, dtype=np.int32)
 
         # target network update setting
         self.replace_target_iter = AGENT_CONFIG["REPLACE_INTERVAL"]
@@ -178,16 +184,21 @@ class AdaptiveBDQ_agent:
             r = tf.convert_to_tensor(self.reward_memory[batch_indices], dtype=tf.float32)
             s_ = tf.convert_to_tensor(self.next_state_memory[batch_indices], dtype=tf.float32)
 
-            # Extract communication context from replay buffer (if enabled)
-            ctx = None
-            next_ctx = None
-            if self.use_comm:
-                ctx = tf.convert_to_tensor(self.context_memory[batch_indices], dtype=tf.float32)
-                next_ctx = tf.convert_to_tensor(self.next_context_memory[batch_indices], dtype=tf.float32)
+            # End-to-end: fetch all_obs from coordinator's shared buffer
+            all_obs_batch = None
+            all_next_obs_batch = None
+            region_ids = None
+            if self.use_comm and self.coordinator is not None:
+                step_indices = self.step_idx_memory[batch_indices]
+                all_obs_batch, all_next_obs_batch = self.coordinator.get_step_obs(step_indices)
+                region_ids = self.region_id_memory[batch_indices]
 
             # 呼叫 update_gradient (這裡傳入全 1 的權重，因為不使用 PER)
             is_weights = tf.ones(self.batch_size, dtype=tf.float32)
-            self.update_gradient(s, a, r, s_, is_weights, ctx, next_ctx)
+            self.update_gradient(s, a, r, s_, is_weights,
+                                all_obs_batch=all_obs_batch,
+                                all_next_obs_batch=all_next_obs_batch,
+                                region_ids=region_ids)
 
             # 目標網路更新
             if self.replace_count % self.replace_target_iter == 0:
@@ -204,17 +215,47 @@ class AdaptiveBDQ_agent:
         for (a, b) in zip(target_var, source_var):
             a.assign(a * (1 - self.tau) + b * self.tau)
 
-    @tf.function
     def update_gradient(self, s, a, r, s_, is_weights,
-                        comm_ctx=None, next_comm_ctx=None):
+                        all_obs_batch=None, all_next_obs_batch=None,
+                        region_ids=None):
         """
-        Compute and apply gradients.
+        Compute and apply gradients with end-to-end communication.
 
-        comm_ctx / next_comm_ctx: optional (batch, comm_context_dim) tensors
-        from RegionCoordinator; used when hierarchical communication is enabled.
+        When comm is enabled, context is recomputed from all_obs within the
+        GradientTape so that TD loss gradients flow back to the coordinator's
+        state_encoder and GAT communication module.
         """
+        # Determine trainable variables (BDQ + coordinator if end-to-end)
+        train_vars = list(self.eval_model.trainable_variables)
+        if self.use_comm and self.coordinator is not None:
+            train_vars += self.coordinator.get_comm_trainable_variables()
+
         with tf.GradientTape() as tape:
-            # Build model inputs (with optional comm context)
+            # ---- End-to-End: recompute comm context inside tape ----
+            comm_ctx = None
+            next_comm_ctx = None
+            if (self.use_comm and self.coordinator is not None
+                    and all_obs_batch is not None):
+                all_obs_tf = tf.convert_to_tensor(all_obs_batch, dtype=tf.float32)
+                all_context = self.coordinator.compute_context_tf(
+                    all_obs_tf, training=True)
+                # Extract this region's context: (batch, hidden_dim)
+                batch_idx = tf.range(tf.shape(all_context)[0])
+                region_ids_tf = tf.cast(
+                    tf.convert_to_tensor(region_ids), tf.int32)
+                indices = tf.stack([batch_idx, region_ids_tf], axis=1)
+                comm_ctx = tf.gather_nd(all_context, indices)
+
+                # Next-state context (stop gradient — target should not
+                # provide gradient signal, same as standard DQN)
+                all_next_obs_tf = tf.convert_to_tensor(
+                    all_next_obs_batch, dtype=tf.float32)
+                next_all_context = self.coordinator.compute_context_tf(
+                    all_next_obs_tf, training=False)
+                next_comm_ctx = tf.stop_gradient(
+                    tf.gather_nd(next_all_context, indices))
+
+            # Build model inputs (with fresh, differentiable comm context)
             eval_inputs = self._build_inputs(s, comm_ctx)
             next_inputs_eval = self._build_inputs(s_, next_comm_ctx)
             next_inputs_target = self._build_inputs(s_, next_comm_ctx)
@@ -264,14 +305,21 @@ class AdaptiveBDQ_agent:
             
             self.loss_his.append(loss.numpy())
 
-        # 5. 套用梯度 (不使用裁剪)
-        gradients = tape.gradient(loss, self.eval_model.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.eval_model.trainable_variables))
+        # 5. 套用梯度 (含 coordinator 的 end-to-end 梯度)
+        gradients = tape.gradient(loss, train_vars)
+        grads_and_vars = [(g, v) for g, v in zip(gradients, train_vars)
+                          if g is not None]
+        if grads_and_vars:
+            g_list, v_list = zip(*grads_and_vars)
+            self.optimizer.apply_gradients(zip(g_list, v_list))
 
-    def store_transition(self, s, a, r, s_, comm_context=None, next_comm_context=None):
+    def store_transition(self, s, a, r, s_, step_idx=-1, region_id=None):
         """
-        Store a transition.  comm_context / next_comm_context are optional numpy
-        arrays of shape (comm_context_dim,) from RegionCoordinator.
+        Store a transition.
+
+        For end-to-end comm: step_idx is the index into coordinator's shared
+        observation buffer; region_id identifies which region this transition
+        belongs to.
         """
         index = self.memory_counter % self.memory_size
         self.state_memory[index] = s
@@ -279,14 +327,9 @@ class AdaptiveBDQ_agent:
         self.reward_memory[index] = r
         self.next_state_memory[index] = s_
         if self.use_comm:
-            self.context_memory[index] = (
-                comm_context if comm_context is not None
-                else np.zeros(self.comm_context_dim, dtype=np.float32)
-            )
-            self.next_context_memory[index] = (
-                next_comm_context if next_comm_context is not None
-                else np.zeros(self.comm_context_dim, dtype=np.float32)
-            )
+            self.step_idx_memory[index] = step_idx
+            if region_id is not None:
+                self.region_id_memory[index] = region_id
         self.memory_counter += 1
 
 

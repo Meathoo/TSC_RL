@@ -415,13 +415,60 @@ class RegionCoordinator:
         self.comm_loss_his = []
         self.train_step_count = 0
 
+        # ---- End-to-End shared observation buffer ----
+        # Stores (all_obs, all_next_obs) per global step so that agents can
+        # recompute context within GradientTape during BDQ training.
+        self.e2e_capacity = self.comm_buffer_size
+        self.e2e_obs = np.zeros((self.e2e_capacity, num_regions, state_dim),
+                                dtype=np.float32)
+        self.e2e_next_obs = np.zeros((self.e2e_capacity, num_regions, state_dim),
+                                     dtype=np.float32)
+        self.e2e_ptr = 0
+        self.e2e_count = 0
+
         print(f"[RegionCoordinator] Initialized: {num_regions} regions, "
               f"msg_dim={self.message_dim}, hidden={self.hidden_dim}, "
               f"heads={self.num_heads}, rounds={self.num_rounds}")
         print(f"[RegionCoordinator] adj_matrix:\n{region_adj_matrix}")
 
     # ------------------------------------------------------------------
-    #  Context computation
+    #  End-to-End observation buffer
+    # ------------------------------------------------------------------
+
+    def store_step(self, all_obs, all_next_obs):
+        """Store one step's observations for end-to-end replay. Returns index."""
+        idx = self.e2e_ptr % self.e2e_capacity
+        self.e2e_obs[idx] = all_obs
+        self.e2e_next_obs[idx] = all_next_obs
+        self.e2e_ptr += 1
+        self.e2e_count = min(self.e2e_count + 1, self.e2e_capacity)
+        return idx
+
+    def get_step_obs(self, indices):
+        """Fetch all_obs and all_next_obs for a batch of step indices."""
+        return self.e2e_obs[indices], self.e2e_next_obs[indices]
+
+    def compute_context_tf(self, all_obs_tf, training=True):
+        """
+        Compute context as differentiable tf tensors (for end-to-end training).
+
+        Args:
+            all_obs_tf: tf.Tensor (batch, num_regions, state_dim)
+            training:   bool
+        Returns:
+            context: tf.Tensor (batch, num_regions, hidden_dim)
+        """
+        features = self.state_encoder(all_obs_tf, training=training)
+        context = self.comm_module(features, self.region_adj_matrix, training=training)
+        return context
+
+    def get_comm_trainable_variables(self):
+        """Return trainable variables of state_encoder + comm_module."""
+        return (list(self.state_encoder.trainable_variables) +
+                list(self.comm_module.trainable_variables))
+
+    # ------------------------------------------------------------------
+    #  Context computation (numpy, for action selection)
     # ------------------------------------------------------------------
 
     def get_context(self, all_observations, training=False):

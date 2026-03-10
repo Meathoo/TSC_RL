@@ -283,7 +283,7 @@ R3 [  0   1   1   1 ]
 
 ## 自監督訓練機制
 
-`RegionCoordinator` 使用雙目標自監督損失函式來訓練通訊模組（與 RL 主要損失分開）：
+`RegionCoordinator` 使用雙目標自監督損失函式來訓練通訊模組（作為 End-to-End 主訓練的輔助）：
 
 ### 訓練目標
 
@@ -303,7 +303,53 @@ $$\mathcal{L} = \mathcal{L}_{\text{self}} + \mathcal{L}_{\text{neighbor}}$$
 
 **關鍵設計**：$\mathcal{L}_{\text{neighbor}}$ 使用 row-normalized adjacency matrix（移除 self-loop）計算鄰居平均 reward。這確保通訊模組必須透過 GAT 訊息傳遞來獲取鄰居資訊，而非僅依賴自身觀測。
 
-**程式碼位置**：`region_communication.py` — `RegionCoordinator.train_step()`
+**程式碼位置**：`region_communication.py` — `RegionCoordinator.train()`
+
+---
+
+## End-to-End 訓練機制
+
+**核心改進**：通訊模組（State Encoder + GAT Comm Module）的梯度直接由 BDQ 的 TD loss 驅動，讓 communication context 對 Q-value 估算有直接影響。
+
+### 問題動機
+
+先前版本中，通訊 context 在 action selection 時計算後轉為 numpy 存入 replay buffer，BDQ 訓練時直接使用存好的 context 作為固定輸入。這導致：
+
+1. **梯度斷裂**：TD loss 的梯度無法回傳到通訊模組（State Encoder / GAT）
+2. **Context 過時**：隨著通訊模組持續更新，replay buffer 中的舊 context 與當前模組不一致
+3. **Gate 退化**：BDQ 的 gate 傾向學成 `gate ≈ 1`，完全忽略 comm context
+
+### 解決方案
+
+在 `update_gradient()` 內部，**於 GradientTape 內重新計算 context**：
+
+```
+                    GradientTape
+┌───────────────────────────────────────────────────────────┐
+│  all_obs ──► State Encoder ──► GAT Comm Module ──► context │
+│                                                     │      │
+│  state ──► BDQ encoder ──► gate(local, context) ──► Q(s,a) │
+│                                                     │      │
+│                                    TD loss ◄────────┘      │
+└───────────────────────────────────────────────────────────┘
+                        │
+             gradients flow to:
+          eval_model + state_encoder + GAT
+```
+
+### 實作細節
+
+1. **共享觀測 buffer**：`RegionCoordinator.store_step(all_obs, all_next_obs)` 將每個 step 的全域觀測存入共享 ring buffer，各 agent 只需記錄 `step_idx`
+2. **Agent 持有 coordinator 引用**：`AdaptiveBDQ_agent(env_config, coordinator=coord, region_id=i)`
+3. **Tape 內重算**：`update_gradient()` 從共享 buffer 取回 `all_obs`，透過 `coordinator.compute_context_tf()` 在 tape 內計算可微分的 context
+4. **Target 梯度隔離**：next-state 的 context 使用 `tf.stop_gradient`，與 DQN 標準一致
+5. **Joint 梯度更新**：`train_vars = eval_model.vars + coordinator.state_encoder.vars + coordinator.comm_module.vars`
+
+### 梯度路徑
+
+$$\nabla_{\theta_{\text{BDQ}}, \theta_{\text{enc}}, \theta_{\text{GAT}}} \; \mathcal{L}_{\text{TD}} = \nabla \left[ r + \gamma Q_{\text{target}}(s') - Q_{\text{eval}}(s, a; \text{context}(\theta_{\text{enc}}, \theta_{\text{GAT}})) \right]^2$$
+
+**程式碼位置**：`AdaptiveBDQ_agent.py` — `update_gradient()`
 
 ---
 
@@ -315,47 +361,30 @@ $$\mathcal{L} = \mathcal{L}_{\text{self}} + \mathcal{L}_{\text{neighbor}}$$
 Step 1: 環境觀測
     env.step() → next_states → assign_state() → obs[num_agents] (raw observations)
 
-Step 2: Level 1 通訊 (RegionCoordinator)
-    all_obs = stack(obs)                                    # (4, state_dim)
-        │
-        ▼ State Encoder
-    region_features = Dense(128)→Dense(64)                  # (4, 64)
-        │
-        ▼ Message Encoder
-    messages = Dense(64)→Dense(32, tanh)                    # (4, 32)
-        │
-        ▼ GAT Round 1 (1-hop)
-    neighbor_agg₁ = GAT(messages, adj_matrix)               # (4, 32)
-    messages₁ = LayerNorm(gate₁ × update₁ + (1-gate₁) × messages)
-        │
-        ▼ GAT Round 2 (2-hop)
-    neighbor_agg₂ = GAT(messages₁, adj_matrix)              # (4, 32)
-    messages₂ = LayerNorm(gate₂ × update₂ + (1-gate₂) × messages₁)
-        │
-        ▼ Message Decoder
-    context = Dense(64)→Dense(64)                           # (4, 64)
+Step 2: Level 1 通訊 — Action Selection (numpy, no gradient)
+    all_obs = stack(obs)                                    # (N, state_dim)
+    context = coordinator.get_context(all_obs)              # (N, 64)
+    agent.choose_action(obs[aid], comm_context=context[aid])
 
-Step 3: Level 0 + Level 2 決策 (每個 Agent)
-    obs[aid]                     context[aid]
-      │                              │
-      ▼ Encoder                      │
-    shared_repr (256)                │
-      │                     comm_proj: Dense(256)
-      │                              │
-      │                     context_processed (256)
-      ├──── concat ─────────────────┤
-      │                              │
-      ▼ Gate                         │
-    gate = sigmoid(...)              │
-      │                              ▼
-    output = gate × shared_repr + (1-gate) × context_processed
-      │
-      ▼ Dueling DQN
-    V(s) + A_i(s,a) → Q_i(s,a)   for each intersection i
+Step 3: 儲存 Transition
+    step_idx = coordinator.store_step(all_obs, all_next_obs)  # 共享 buffer
+    agent.store_transition(obs, action, reward, next_obs, step_idx=step_idx, region_id=aid)
 
-Step 4: 自監督通訊訓練 (每 10 步)
-    RegionCoordinator.train_step(obs_batch, reward_batch)
-    → L_self (predict own reward) + L_neighbor (predict neighbor mean reward)
+Step 4: End-to-End 訓練 (每 LEARNING_INTERVAL 步)
+    batch = sample(replay_buffer)
+    all_obs_batch = coordinator.get_step_obs(batch.step_idx)  # 從共享 buffer 取回
+
+    ┌─── GradientTape ──────────────────────────────────────────────┐
+    │  context = coordinator.compute_context_tf(all_obs_batch)      │
+    │  comm_ctx = context[:, region_id, :]                          │
+    │  Q(s,a) = eval_model([state, comm_ctx])                      │
+    │  TD_loss = (r + γ·Q_target(s') − Q(s,a))²                    │
+    └───────────────────────────────────────────────────────────────┘
+    gradients → eval_model + state_encoder + GAT comm_module
+
+Step 5: 自監督輔助訓練 (每 10 步)
+    RegionCoordinator.train(obs_batch, reward_batch)
+    → L_self + L_neighbor (額外正則化)
 ```
 
 ---

@@ -147,10 +147,15 @@ def init_exp(args):
 
     if EXP_CONFIG["TRAINING_PARADIM"]=="CLDE":
 
-        agent=EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config)
+        agent=EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config,
+                                                          coordinator=coordinator,
+                                                          region_id=0)
         agents=[agent for _ in range(EXP_CONFIG["AGETN_NUM"])]
     else:
-        agents = [EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config) for _ in range(EXP_CONFIG["AGETN_NUM"])]
+        agents = [EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config,
+                                                              coordinator=coordinator,
+                                                              region_id=i)
+                  for i in range(EXP_CONFIG["AGETN_NUM"])]
 
     # ---- Hierarchical Region Communication: build RegionCoordinator ----
     COMM_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("COMM_CONFIG", {})
