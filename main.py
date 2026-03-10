@@ -19,12 +19,15 @@ tf.config.experimental_run_functions_eagerly(True)
 
 # np.random.se
 # np.random.seed(0)
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--netname", type=str, default="Hangzhou")
     parser.add_argument("--netshape", type=str, default="4_4")
     parser.add_argument("--flow", type=str, default="real")
     parser.add_argument("--agent", type=str, default="ABDQ")
+    parser.add_argument("--episode", type=int, default=None,
+                        help="Override EXP_CONFIG['EPISODE'] when provided")
     return parser.parse_args()
 
 # python main.py --netname Hangzhou --netshape 4_4 --flow real --agent ABDQ
@@ -52,8 +55,13 @@ def init_exp(args):
     BDQ_AGENT_CONFIG = copy.deepcopy(agent_config.BDQ_AGENT_CONFIG)
     ENV_CONFIG = copy.deepcopy(env_config.ENV_CONFIG)
     EXP_CONFIG = copy.deepcopy(exp_config.EXP_CONFIG)
+    if args.episode is not None:
+        if args.episode <= 0:
+            raise ValueError("--episode must be a positive integer")
+        EXP_CONFIG["EPISODE"] = args.episode
     # EXP_CONFIG["EPISODE"]=2000                           # use 2000 episodes for experiments in paper
     # Construct Cityflow Configuration File and ENV DICT
+
 
     roadnet_file = "roadnet_" + netshape + ".json"
 

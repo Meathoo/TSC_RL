@@ -112,33 +112,32 @@ class AdaptiveBDQ_agent:
         return np.array(joint_action)
 
     def learn(self):
+        # print("learn")
         available_count = min(self.memory_size, self.memory_counter)
         self.learn_count += 1
-        
-        # 這裡保持與 origin 一致的門檻（10000 筆才開始練）
         if available_count > 10000:
             self.replace_count += 1
             batch_indices = np.random.choice(available_count, self.batch_size)
 
-            # 改進點：轉換 Tensor 的方式與 bk 對齊，確保 float32 型態
-            s = tf.convert_to_tensor(self.state_memory[batch_indices], dtype=tf.float32)
-            a = tf.convert_to_tensor(self.action_memory[batch_indices], dtype=tf.float32)
-            r = tf.convert_to_tensor(self.reward_memory[batch_indices], dtype=tf.float32)
-            s_ = tf.convert_to_tensor(self.next_state_memory[batch_indices], dtype=tf.float32)
-
-            # 呼叫 update_gradient (這裡傳入全 1 的權重，因為不使用 PER)
-            is_weights = tf.ones(self.batch_size, dtype=tf.float32)
-            self.update_gradient(s, a, r, s_, is_weights)
-
-            # 目標網路更新
+            s = tf.convert_to_tensor(self.state_memory[batch_indices])
+            a = tf.convert_to_tensor(self.action_memory[batch_indices])
+            r = tf.convert_to_tensor(self.reward_memory[batch_indices])
+            r = tf.cast(r, dtype=tf.float32)
+            s_ = tf.convert_to_tensor(self.next_state_memory[batch_indices])
+            # update_start=time.time()
+            self.update_gradient(s, a, r, s_)
+            # print("update ",time.time()-update_start)
             if self.replace_count % self.replace_target_iter == 0:
                 print("replace para")
+                # start_time=time.time()
                 self.replace_para(self.target_model.variables, self.eval_model.variables)
-                
-        # Epsilon 更新邏輯保持 origin 的線性衰減
+                # print("replace cost",time.time()-start_time)
+        # update epsilon
         fraction = min(float(self.learn_count) / self.decay_steps, 1)
         self.epsilon = self.max_epsilon + fraction * (self.min_epsilon - self.max_epsilon)
-        self.epsilon = max(self.epsilon, 0.001)
+        # self.epsilon *= 0.99965467#0.999965
+        if self.epsilon < 0.001:
+            self.epsilon = 0.001
 
     @tf.function
     def replace_para(self, target_var, source_var):
@@ -146,54 +145,57 @@ class AdaptiveBDQ_agent:
             a.assign(a * (1 - self.tau) + b * self.tau)
 
     @tf.function
-    def update_gradient(self, s, a, r, s_, is_weights):
+    def update_gradient(self, s, a, r, s_):
         with tf.GradientTape() as tape:
-            # 1. 取得 Eval 網路輸出，指定 training=True
-            q_eval = self.eval_model(s, training=True)
-            
-            # 2. 構建 Mask (這部分參考 bk 的邏輯)
-            eval_act_index = tf.cast(a, tf.int32)
+            q_eval = self.eval_model(s)
+            q_target = q_eval.numpy().copy()
+            # mask construction
+            eval_act_index = a.numpy().astype(int)  # action index of experience
             eval_act_index_mask = tf.one_hot(eval_act_index, self.subaction_num)
-            
-            # 處理閒置分支 (Idle branches)
-            idle_mask = tf.where(eval_act_index == -1, 0.0, 1.0)
+            eval_act_index_reverse_mask = tf.one_hot(eval_act_index, self.subaction_num, on_value=0.0,
+                                                     off_value=1.0)  # we need reversed one hot matrix to reserve the value of not eval action index
+            idle_index = np.where(eval_act_index == -1)
+            idle_mask = np.ones((self.batch_size, self.action_dim))
+            idle_mask[idle_index] = 0
+            # batch_index=np.where(eval_act_index == -1)
+            q_target = tf.multiply(q_target, eval_act_index_reverse_mask)  # remove the value on eval index
 
-            # 3. 計算 Target Q (Double DQN 邏輯)
-            q_next_eval = self.eval_model(s_, training=False) 
-            greedy_next_action = tf.argmax(q_next_eval, axis=2)
-            greedy_next_action_mask = tf.one_hot(greedy_next_action, self.subaction_num)
+            # on policy estimate next value
+            q_next_eval = self.eval_model(s_).numpy().copy()
+            greedy_next_action = np.argmax(q_next_eval, axis=2)  # get greedy action index of next eval
+            greedy_next_action_mask = tf.one_hot(greedy_next_action,
+                                                 self.subaction_num)  # mask to select only correpsond q value
 
-            q_target_s_next = self.target_model(s_, training=False)
-            masked_q_target_s_next = tf.multiply(q_target_s_next, greedy_next_action_mask)
-            
-            # 根據 TD 算子類型計算 V(s')
+            q_target_s_next = self.target_model(s_).numpy().copy()  # compute with target network estimate
+            masked_q_target_s_next = tf.multiply(q_target_s_next,
+                                                 greedy_next_action_mask)  # selected q value based on on-policy greedy action
             if self.td_operator_type == 'MEAN':
-                branch_v = tf.reduce_sum(masked_q_target_s_next, 2)
-                branch_v = tf.multiply(branch_v, idle_mask)
-                v_sum = tf.reduce_sum(branch_v, axis=1, keepdims=True)
-                v_count = tf.reduce_sum(idle_mask, axis=1, keepdims=True)
-                operator = v_sum / (v_count + 1e-8) # 避免除以零
+                operator = tf.reduce_sum(masked_q_target_s_next, 2)  # compute greedy
+                operator = tf.multiply(operator, idle_mask)  # remove value of idle branches
+                a = tf.reduce_sum(operator, axis=1, keepdims=True)
+                b = tf.cast(1 / tf.reduce_sum(idle_mask, axis=1, keepdims=True), tf.float32)
+                operator = tf.multiply(a, b)
+                operator = tf.multiply(tf.expand_dims(operator, -1), eval_act_index_mask)
             elif self.td_operator_type == "MAX":
-                branch_v = tf.reduce_sum(masked_q_target_s_next, 2)
-                operator = tf.reduce_max(branch_v, axis=1, keepdims=True)
-            elif self.td_operator_type == "NAIVE":
+                # print("max operator")
                 operator = tf.reduce_sum(masked_q_target_s_next, 2)
-            
-            # 4. 計算 TD Error 與 Loss
-            # 這裡與 bk 一致：只計算特定 action 分支的 q_eval
-            q_eval_selected = tf.reduce_sum(tf.multiply(q_eval, eval_act_index_mask), axis=[1, 2])
-            
-            # 計算 Target (R + Gamma * V)
-            # 注意：若為多分支，r 通常是共用的
-            target_val = tf.squeeze(r) + self.gamma * tf.squeeze(operator)
-            
-            # 計算 MSE Loss
-            td_errors = target_val - q_eval_selected
-            loss = tf.reduce_mean(tf.square(td_errors)) 
-            
-            self.loss_his.append(loss.numpy())
+                operator = tf.expand_dims(tf.reduce_max(operator, 1), -1)
+                operator = tf.multiply(tf.expand_dims(operator, -1), eval_act_index_mask)
+                # operator=tf.reduce_max(operator)
+            elif self.td_operator_type == "NAIVE":
+                # print("naive")
+                operator = tf.reduce_sum(masked_q_target_s_next, 2)
+                operator = tf.multiply(tf.expand_dims(operator, -1), eval_act_index_mask)
+            else:
+                raise Exception("unknown")
 
-        # 5. 套用梯度 (不使用裁剪)
+            masked_r = tf.multiply(tf.expand_dims(r, -1), eval_act_index_mask)
+            q_target = q_target + masked_r + self.gamma * operator  # fill the q_target value of eval act
+            # only replace the value of action index in experience
+            loss = tf.keras.losses.mean_squared_error(q_eval, tf.convert_to_tensor(q_target))
+            self.loss_his.append(np.average(loss.numpy()))
+
+            # print(np.average(loss.numpy()))
         gradients = tape.gradient(loss, self.eval_model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.eval_model.trainable_variables))
 
@@ -217,4 +219,3 @@ class AdaptiveBDQ_agent:
         """
         # save critic model
         self.eval_model.save(os.path.join(model_folder, "eval_model.h5"))
-
