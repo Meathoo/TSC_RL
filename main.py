@@ -145,18 +145,6 @@ def init_exp(args):
     }
     EXP_CONFIG.update(agent_env_config)
 
-    if EXP_CONFIG["TRAINING_PARADIM"]=="CLDE":
-
-        agent=EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config,
-                                                          coordinator=coordinator,
-                                                          region_id=0)
-        agents=[agent for _ in range(EXP_CONFIG["AGETN_NUM"])]
-    else:
-        agents = [EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config,
-                                                              coordinator=coordinator,
-                                                              region_id=i)
-                  for i in range(EXP_CONFIG["AGETN_NUM"])]
-
     # ---- Hierarchical Region Communication: build RegionCoordinator ----
     COMM_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("COMM_CONFIG", {})
     coordinator = None
@@ -173,10 +161,18 @@ def init_exp(args):
             region_adj_matrix=adj_matrix,
             config=COMM_CONFIG
         )
-        print(f"[main] RegionCoordinator created ({EXP_CONFIG['AGETN_NUM']} regions, "
-              f"state_dim={state_dim})")
+
+    if EXP_CONFIG["TRAINING_PARADIM"]=="CLDE":
+
+        agent=EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config,
+                                                          coordinator=coordinator,
+                                                          region_id=0)
+        agents=[agent for _ in range(EXP_CONFIG["AGETN_NUM"])]
     else:
-        print("[main] Hierarchical communication disabled (COMM_CONFIG.ENABLED=False)")
+        agents = [EXP_CONFIG["AGENT_CLASS_DICT"][agent_type](agent_env_config,
+                                                              coordinator=coordinator,
+                                                              region_id=i)
+                  for i in range(EXP_CONFIG["AGETN_NUM"])]
 
     print(EXP_CONFIG)
     print(ENV_CONFIG)
