@@ -99,6 +99,7 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
         episode_start_time=time.time()
         step_itsx_reward=[]
         episode_reward=[]
+        step_queue_length = []  # accumulate per-step for time-averaged AQL
         """-------"""
         for step in range(int(ENV_CONFIG["SIM_TIMESPAN"]/ENV_CONFIG["ACTION_INTERVAL"])):
             actions_id=[]
@@ -124,12 +125,13 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
             """----update step log---"""
             step_itsx_reward.append([value for _,value in itsx_rewards.items()])
             episode_reward.append(np.average(rewards))
+            step_queue_length.append(env.get_average_queue_length())  # time-averaged AQL
             """-----------------"""
             obs=next_obs
         """----update episode log------"""
         episode_throughput.append(env.get_throughput())
         episode_travel_time.append(env.get_average_travel_time())
-        episode_queue_length.append(env.get_average_queue_length())  # add
+        episode_queue_length.append(float(np.mean(step_queue_length)))  # time-averaged per-intersection AQL
         episode_intersection_level_rewards.append(np.array(step_itsx_reward))
         """----------------------------"""
         episode_wall_time = time.time() - episode_start_time
@@ -200,6 +202,14 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
     best_att_ep = int(att_array.argmin())
     last100_att = float(att_array[-100:].mean()) if len(att_array) >= 100 else float(att_array.mean())
 
+    aql_array = np.array(episode_queue_length)
+    best_aql = float(aql_array.min())
+    best_aql_ep = int(aql_array.argmin())
+
+    tp_array = np.array(episode_throughput)
+    best_throughput = int(tp_array.max())
+    best_throughput_ep = int(tp_array.argmax())
+
     # Find convergence point (rolling-20 < 480)
     converge_ep = None
     if len(att_array) >= 20:
@@ -225,6 +235,10 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
         "best_att": round(best_att, 2),
         "best_att_episode": best_att_ep,
         "last100_att": round(last100_att, 2),
+        "best_aql": round(best_aql, 4),
+        "best_aql_episode": best_aql_ep,
+        "best_throughput": best_throughput,
+        "best_throughput_episode": best_throughput_ep,
         "converge_episode_rolling20_lt480": converge_ep,
         "agent_param_counts": agent_param_counts,
         "features_enabled": {
