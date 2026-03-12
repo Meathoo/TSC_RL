@@ -295,19 +295,19 @@ class CityflowEnvWrapper:
     # add
     def get_average_queue_length(self):
         """
-        :return: average queue length (waiting vehicles) per intersection.
-                 Matches paper definition: sum all waiting vehicles per intersection,
-                 then average across intersections.
+        :return: time-averaged per-lane AQL matching paper definition.
+                 Divides total waiting vehicles by total entering lane count.
         """
         lane_waiting_vehicle_count = self.eng.get_lane_waiting_vehicle_count()
         total_queue = 0
+        total_lanes = 0
         for intersection_id in self.intersection_ids:
             in_roads_id = self.intersections[intersection_id].enter_roads
             for in_road_id in in_roads_id:
                 for lane_index in range(3):  # each road has three lanes
                     lane_id = in_road_id + '_' + str(lane_index)
                     total_queue += lane_waiting_vehicle_count.get(lane_id, 0)
-        num_intersections = len(self.intersection_ids)
-        if num_intersections == 0:
+                    total_lanes += 1
+        if total_lanes == 0:
             return 0
-        return total_queue / num_intersections
+        return total_queue / total_lanes
