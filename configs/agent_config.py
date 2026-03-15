@@ -14,6 +14,11 @@ AGENT_CONFIG={
 BDQ_AGENT_CONFIG={
     "TD_OPERATOR":"MEAN",
     "LEARNING_RATE":0.0001,
+    # ---- Quick runtime profiling ----
+    "PROFILE_CONFIG": {
+        "ENABLED": True,              # print per-episode timing breakdown
+        "PRINT_INTERVAL": 1,          # print every N episodes
+    },
     # ---- Hierarchical Region Communication ----
     "COMM_CONFIG": {
         "ENABLED": True,               # set True to enable inter-region communication
@@ -25,10 +30,12 @@ BDQ_AGENT_CONFIG={
         "COMM_DROPOUT_RATE": 0.1,       # GAT attention dropout (only used when COMM_TYPE="GAT")
         "COMM_LEARNING_RATE": 0.0001,   # Adam learning rate for communication module
         "PROXIMITY_THRESHOLD": 2,       # Manhattan distance threshold for region adjacency
+        "E2E_ENABLED": False,           # default off: use self-supervised comm training only (much faster)
         "E2E_FREQ": 5,                  # E2E backward through comm every N learn steps (1=always, 5=20% of steps)
         # --- self-supervised training ---
         "COMM_GRAD_CLIP_NORM": 5.0,     # gradient clipping (global norm)
-        "COMM_TRAIN_INTERVAL": 10,      # train comm module every N global steps
+        "COMM_TRAIN_INTERVAL": 50,      # train comm module every N global steps (higher = faster)
+        "COMM_WARMUP_STEPS": 10000,     # start comm self-supervised training after replay warmup
         "COMM_BATCH_SIZE": 64,          # self-supervised training batch size
         "COMM_BUFFER_SIZE": 50000,      # replay buffer capacity
     },

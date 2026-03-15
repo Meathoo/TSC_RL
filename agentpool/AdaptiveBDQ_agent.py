@@ -7,7 +7,8 @@ from tensorflow.keras import layers
 from configs import agent_config
 import copy
 
-tf.config.experimental_run_functions_eagerly(True)
+# Keep graph execution for speed. Eager mode is useful for debugging only.
+tf.config.experimental_run_functions_eagerly(False)
 
 
 def build_network(state_dim, action_dim, sub_action_num, comm_context_dim=0):
@@ -78,6 +79,7 @@ class AdaptiveBDQ_agent:
         COMM_CONFIG = agent_config.BDQ_AGENT_CONFIG.get("COMM_CONFIG", {})
         self.use_comm = COMM_CONFIG.get("ENABLED", False)
         self.comm_context_dim = COMM_CONFIG.get("COMM_HIDDEN_DIM", 64) if self.use_comm else 0
+        self.e2e_enabled = COMM_CONFIG.get("E2E_ENABLED", False)
         self.e2e_freq = COMM_CONFIG.get("E2E_FREQ", 1)  # only do E2E backward every N learn steps
 
         # End-to-end: reference to shared coordinator and this agent's region index
@@ -140,35 +142,41 @@ class AdaptiveBDQ_agent:
             return [state_tensor, comm_context_tensor]
         return state_tensor
 
-    def choose_action(self, state, idle_id=None, comm_context=None):
+    def choose_action(self, state, idle_id=None, comm_context=None, do_explore=None):
         """
         Choose action given current state (and optional comm context).
 
         :param state:        1-D numpy array of shape (state_dim,)
         :param idle_id:      list of branch indices that are idle (action=-1)
         :param comm_context: 1-D numpy array (comm_context_dim,) from RegionCoordinator
+        :param do_explore:   Optional bool. If True, use random action directly.
         :return: numpy array of joint actions
         """
-        state = state[np.newaxis, :]  # (1, state_dim)
-        ctx = None
-        if self.use_comm and comm_context is not None:
-            ctx = tf.convert_to_tensor(comm_context[np.newaxis, :], dtype=tf.float32)
-        inputs = self._build_inputs(tf.convert_to_tensor(state, dtype=tf.float32), ctx)
-        action_branch_value = self.eval_model(inputs)[0]
-        joint_action = []
-        if np.random.random() > self.epsilon:
-            # greedy choice
-            for i in range(self.action_dim):
-                joint_action.append(np.argmax(action_branch_value[i]))
+        # Exploration decision first: skip NN forward entirely in random path.
+        if do_explore is None:
+            do_explore = (np.random.random() <= self.epsilon)
+
+        if not do_explore:
+            state = np.asarray(state, dtype=np.float32)[np.newaxis, :]  # (1, state_dim)
+            ctx = None
+            if self.use_comm and comm_context is not None:
+                ctx = tf.convert_to_tensor(np.asarray(comm_context, dtype=np.float32)[np.newaxis, :],
+                                           dtype=tf.float32)
+            inputs = self._build_inputs(tf.convert_to_tensor(state, dtype=tf.float32), ctx)
+            action_branch_value = self.eval_model(inputs, training=False)[0]
+            # Greedy choice (vectorized over branches)
+            joint_action = tf.argmax(action_branch_value, axis=1, output_type=tf.int32).numpy()
         else:
-            # random
-            for i in range(self.action_dim):
-                joint_action.append(np.random.randint(0, self.subaction_num))
+            # Random choice (vectorized)
+            joint_action = np.random.randint(
+                0, self.subaction_num, size=self.action_dim, dtype=np.int32
+            )
+
         if idle_id is not None:
-            #
             for id in idle_id:
                 joint_action[id] = -1
-        return np.array(joint_action)
+
+        return joint_action
 
     def learn(self):
         available_count = min(self.memory_size, self.memory_counter)
@@ -196,7 +204,7 @@ class AdaptiveBDQ_agent:
 
             # 呼叫 update_gradient (這裡傳入全 1 的權重，因為不使用 PER)
             is_weights = tf.ones(self.batch_size, dtype=tf.float32)
-            do_e2e = (self.learn_count % self.e2e_freq == 0)
+            do_e2e = self.e2e_enabled and self.e2e_freq > 0 and (self.learn_count % self.e2e_freq == 0)
             self.update_gradient(s, a, r, s_, is_weights,
                                 all_obs_batch=all_obs_batch,
                                 all_next_obs_batch=all_next_obs_batch,

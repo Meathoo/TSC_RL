@@ -17,7 +17,7 @@ import json
 # Hierarchical Region Communication
 from agentpool.region_communication import RegionCoordinator, build_region_adjacency_matrix
 
-tf.config.experimental_run_functions_eagerly(True)
+tf.config.experimental_run_functions_eagerly(False)
 
 
 # np.random.se
@@ -67,9 +67,9 @@ def init_exp(args):
     # add
     if netname == "Hangzhou" and netshape == "4_4":
         if flow == "flat":
-            flow_path = os.path.join(netname, "Hangzhou_4_4_real_5734.json")
+            flow_path = os.path.join(netname, "Hangzhou_4_4_real.json")       # 2983 vehicles — paper flat
         elif flow == "peak":
-            flow_path = os.path.join(netname, "Hangzhou_4_4_real_5816.json")
+            flow_path = os.path.join(netname, "Hangzhou_4_4_real_5734.json")  # 6538 vehicles — paper peak
     if netname == "Syn" and netshape == "4_4":
         flow_path = os.path.join(netname, "syn_4_4_gaussian_500_1h.json")
         flow = "gaussian"

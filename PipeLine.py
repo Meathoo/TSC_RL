@@ -86,12 +86,21 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
     episode_queue_length = [] # add
     episode_travel_time=[]
     comm_train_interval = BDQ_AGENT_CONFIG.get("COMM_CONFIG", {}).get("COMM_TRAIN_INTERVAL", 10)
+    comm_warmup_steps = BDQ_AGENT_CONFIG.get("COMM_CONFIG", {}).get("COMM_WARMUP_STEPS", 10000)
+    profile_cfg = BDQ_AGENT_CONFIG.get("PROFILE_CONFIG", {})
+    profile_enabled = profile_cfg.get("ENABLED", True)
+    profile_print_interval = profile_cfg.get("PRINT_INTERVAL", 1)
     """-------------"""
 
     # ---- Training Log (timing + key metrics) ----
     training_start_time = time.time()
     episode_logs = []  # per-episode detailed log
     learn_call_count = 0  # total learn() calls across all agents
+    total_env_step_time = 0.0
+    total_comm_forward_time = 0.0
+    total_agent_learn_time = 0.0
+    total_choose_action_time = 0.0
+    total_comm_train_time = 0.0
 
     for episode in range(EXP_CONFIG["EPISODE"]):
         state=env.reset()
@@ -101,47 +110,72 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
         episode_start_time=time.time()
         step_itsx_reward=[]
         episode_reward=[]
+        ep_env_step_time = 0.0
+        ep_comm_forward_time = 0.0
+        ep_agent_learn_time = 0.0
+        ep_choose_action_time = 0.0
+        ep_comm_train_time = 0.0
         """-------"""
         for step in range(int(ENV_CONFIG["SIM_TIMESPAN"]/ENV_CONFIG["ACTION_INTERVAL"])):
             actions_id=[]
             global_step += 1
 
+            # Pre-sample exploration decisions so we can skip unnecessary comm/NN forward.
+            explore_flags = [np.random.random() <= agent.epsilon for agent in agents]
+            need_greedy = not all(explore_flags)
+
             # ---- Level 1: Compute inter-region communication context ----
             comm_context = None  # (num_regions, hidden_dim) or None
-            if coordinator is not None:
+            if coordinator is not None and need_greedy:
+                t_comm_fwd_start = time.perf_counter()
                 all_obs = np.stack(obs)
-                comm_context = coordinator.get_context(all_obs, training=True)
+                comm_context = coordinator.get_context(all_obs, training=False)
+                ep_comm_forward_time += (time.perf_counter() - t_comm_fwd_start)
 
+            t_choose_start = time.perf_counter()
             for aid,agent in enumerate(agents):
                 ctx = comm_context[aid] if comm_context is not None else None
-                action_id=agent.choose_action(obs[aid],idle_branches_id[aid], comm_context=ctx)
+                action_id=agent.choose_action(
+                    obs[aid],
+                    idle_branches_id[aid],
+                    comm_context=ctx,
+                    do_explore=explore_flags[aid],
+                )
                 actions_id.append(action_id)
+            ep_choose_action_time += (time.perf_counter() - t_choose_start)
             joint_actions=convert_actions(actions_id,itsx_assignment)
 
+            t_env_step_start = time.perf_counter()
             next_states, itsx_rewards, done, log_metric = env.step(joint_actions)
+            ep_env_step_time += (time.perf_counter() - t_env_step_start)
 
             next_obs = assign_state(next_states,itsx_assignment,EXP_CONFIG["ITSX_STATE_DIM"])
             rewards = assign_reward(itsx_rewards,itsx_assignment)
 
-            # ---- Level 1: Compute next-step communication context ----
-            next_comm_context = None
+            # ---- Level 1: Store communication training data ----
             if coordinator is not None:
                 all_next_obs = np.stack(next_obs)
-                next_comm_context = coordinator.get_context(all_next_obs, training=False)
                 coordinator.store(all_next_obs, rewards)
-                # End-to-end: store all_obs/all_next_obs in shared buffer
-                step_idx = coordinator.store_step(np.stack(obs), all_next_obs)
-                if global_step % comm_train_interval == 0:
+                # End-to-end: only store step observations when E2E backprop is enabled.
+                e2e_active = any(getattr(a, 'e2e_enabled', False) for a in agents)
+                step_idx = coordinator.store_step(np.stack(obs), all_next_obs) if e2e_active else -1
+                if global_step > comm_warmup_steps and global_step % comm_train_interval == 0:
+                    t_comm_train_start = time.perf_counter()
                     coordinator.train()
+                    ep_comm_train_time += (time.perf_counter() - t_comm_train_start)
+            else:
+                step_idx = -1
 
             if not done:
                 # only store experience and learn when not finished
                 for aid in range(len(agents)):
                     agents[aid].store_transition(obs[aid], actions_id[aid], rewards[aid], next_obs[aid],
-                                                 step_idx=step_idx if coordinator is not None else -1,
+                                                 step_idx=step_idx,
                                                  region_id=aid)
                 if global_step % EXP_CONFIG["LEARNING_INTERVAL"] == 0:
+                    t_learn_start = time.perf_counter()
                     agent_learn()
+                    ep_agent_learn_time += (time.perf_counter() - t_learn_start)
                     learn_call_count += 1
             """----update step log---"""
             step_itsx_reward.append([value for _,value in itsx_rewards.items()])
@@ -156,6 +190,11 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
         """----------------------------"""
         episode_wall_time = time.time() - episode_start_time
         elapsed_total = time.time() - training_start_time
+        total_env_step_time += ep_env_step_time
+        total_comm_forward_time += ep_comm_forward_time
+        total_agent_learn_time += ep_agent_learn_time
+        total_choose_action_time += ep_choose_action_time
+        total_comm_train_time += ep_comm_train_time
 
         # Collect per-agent metrics
         agent_grad_norms = []
@@ -189,6 +228,17 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
             "avg_loss": round(float(np.mean(agent_losses)), 6) if agent_losses else None,
             "memory_counter": agent_memory_counts[0] if agent_memory_counts else 0,
             "learn_calls": learn_call_count,
+            "profile_env_step_sec": round(ep_env_step_time, 4),
+            "profile_comm_forward_sec": round(ep_comm_forward_time, 4),
+            "profile_agent_learn_sec": round(ep_agent_learn_time, 4),
+            "profile_choose_action_sec": round(ep_choose_action_time, 4),
+            "profile_comm_train_sec": round(ep_comm_train_time, 4),
+            "profile_other_sec": round(max(0.0, episode_wall_time - ep_env_step_time - ep_comm_forward_time - ep_agent_learn_time - ep_choose_action_time - ep_comm_train_time), 4),
+            "profile_env_step_pct": round(100.0 * ep_env_step_time / max(episode_wall_time, 1e-9), 2),
+            "profile_comm_forward_pct": round(100.0 * ep_comm_forward_time / max(episode_wall_time, 1e-9), 2),
+            "profile_agent_learn_pct": round(100.0 * ep_agent_learn_time / max(episode_wall_time, 1e-9), 2),
+            "profile_choose_action_pct": round(100.0 * ep_choose_action_time / max(episode_wall_time, 1e-9), 2),
+            "profile_comm_train_pct": round(100.0 * ep_comm_train_time / max(episode_wall_time, 1e-9), 2),
         }
         episode_logs.append(ep_log)
 
@@ -205,6 +255,25 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
             "lr": round(float(np.mean(agent_lrs)), 8) if agent_lrs else '-',
         }
         print("log_msg:\n", log_msg)
+        if profile_enabled and ((episode + 1) % max(profile_print_interval, 1) == 0):
+            other_time = max(0.0, episode_wall_time - ep_env_step_time - ep_comm_forward_time - ep_agent_learn_time - ep_choose_action_time - ep_comm_train_time)
+            print(
+                "profile_msg:\n",
+                {
+                    "episode": episode,
+                    "env.step_sec": round(ep_env_step_time, 3),
+                    "comm.forward_sec": round(ep_comm_forward_time, 3),
+                    "agent.learn_sec": round(ep_agent_learn_time, 3),
+                    "choose_action_sec": round(ep_choose_action_time, 3),
+                    "comm.train_sec": round(ep_comm_train_time, 3),
+                    "other_sec": round(other_time, 3),
+                    "env.step_pct": round(100.0 * ep_env_step_time / max(episode_wall_time, 1e-9), 1),
+                    "comm.forward_pct": round(100.0 * ep_comm_forward_time / max(episode_wall_time, 1e-9), 1),
+                    "agent.learn_pct": round(100.0 * ep_agent_learn_time / max(episode_wall_time, 1e-9), 1),
+                    "choose_action_pct": round(100.0 * ep_choose_action_time / max(episode_wall_time, 1e-9), 1),
+                    "comm.train_pct": round(100.0 * ep_comm_train_time / max(episode_wall_time, 1e-9), 1),
+                }
+            )
 
         # Estimate remaining time
         if episode > 0:
@@ -221,6 +290,14 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
     best_att = float(att_array.min())
     best_att_ep = int(att_array.argmin())
     last100_att = float(att_array[-100:].mean()) if len(att_array) >= 100 else float(att_array.mean())
+
+    aql_array = np.array(episode_queue_length)
+    best_aql = float(aql_array.min())
+    best_aql_ep = int(aql_array.argmin())
+
+    tp_array = np.array(episode_throughput)
+    best_throughput = int(tp_array.max())
+    best_throughput_ep = int(tp_array.argmax())
 
     # Find convergence point (rolling-20 < 480)
     converge_ep = None
@@ -247,13 +324,24 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
         "best_att": round(best_att, 2),
         "best_att_episode": best_att_ep,
         "last100_att": round(last100_att, 2),
+        "best_aql": round(best_aql, 4),
+        "best_aql_episode": best_aql_ep,
+        "best_throughput": best_throughput,
+        "best_throughput_episode": best_throughput_ep,
         "converge_episode_rolling20_lt480": converge_ep,
+        "profile_avg_env_step_sec": round(total_env_step_time / max(EXP_CONFIG["EPISODE"], 1), 4),
+        "profile_avg_comm_forward_sec": round(total_comm_forward_time / max(EXP_CONFIG["EPISODE"], 1), 4),
+        "profile_avg_agent_learn_sec": round(total_agent_learn_time / max(EXP_CONFIG["EPISODE"], 1), 4),
+        "profile_avg_choose_action_sec": round(total_choose_action_time / max(EXP_CONFIG["EPISODE"], 1), 4),
+        "profile_avg_comm_train_sec": round(total_comm_train_time / max(EXP_CONFIG["EPISODE"], 1), 4),
+        "profile_avg_other_sec": round(max(0.0, total_training_time - total_env_step_time - total_comm_forward_time - total_agent_learn_time - total_choose_action_time - total_comm_train_time) / max(EXP_CONFIG["EPISODE"], 1), 4),
         "agent_param_counts": agent_param_counts,
         "features_enabled": {
             "gradient_clipping": agent_config.BDQ_AGENT_CONFIG.get("Gradient_Clipping", False),
             "cosine_lr": agent_config.BDQ_AGENT_CONFIG.get("CosineDecay", False),
             "PER": agent_config.BDQ_AGENT_CONFIG.get("Prioritized_Experience_Replay", False),
             "noisy_net": agent_config.BDQ_AGENT_CONFIG.get("NoisyNet", False),
+            "quick_profile": profile_enabled,
         },
     }
 
