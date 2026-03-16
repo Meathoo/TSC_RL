@@ -197,10 +197,14 @@ class AdaptiveBDQ_agent:
             all_obs_batch = None
             all_next_obs_batch = None
             region_ids = None
+            comm_valid_mask = None
             if self.use_comm and self.coordinator is not None:
                 step_indices = self.step_idx_memory[batch_indices]
-                all_obs_batch, all_next_obs_batch = self.coordinator.get_step_obs(step_indices)
-                region_ids = self.region_id_memory[batch_indices]
+                comm_valid_mask = (step_indices >= 0).astype(np.float32)
+                if np.any(step_indices >= 0):
+                    safe_indices = np.where(step_indices >= 0, step_indices, 0)
+                    all_obs_batch, all_next_obs_batch = self.coordinator.get_step_obs(safe_indices)
+                    region_ids = self.region_id_memory[batch_indices]
 
             # 呼叫 update_gradient (這裡傳入全 1 的權重，因為不使用 PER)
             is_weights = tf.ones(self.batch_size, dtype=tf.float32)
@@ -209,6 +213,7 @@ class AdaptiveBDQ_agent:
                                 all_obs_batch=all_obs_batch,
                                 all_next_obs_batch=all_next_obs_batch,
                                 region_ids=region_ids,
+                                comm_valid_mask=comm_valid_mask,
                                 e2e=do_e2e)
 
             # 目標網路更新
@@ -228,7 +233,7 @@ class AdaptiveBDQ_agent:
 
     def update_gradient(self, s, a, r, s_, is_weights,
                         all_obs_batch=None, all_next_obs_batch=None,
-                        region_ids=None, e2e=True):
+                        region_ids=None, comm_valid_mask=None, e2e=True):
         """
         Compute and apply gradients with end-to-end communication.
 
@@ -262,6 +267,10 @@ class AdaptiveBDQ_agent:
             indices = tf.stack([batch_idx, region_ids_tf], axis=1)
             comm_ctx_frozen = tf.gather_nd(all_context, indices)
             next_comm_ctx_frozen = tf.gather_nd(next_all_context, indices)
+            if comm_valid_mask is not None:
+                valid = tf.expand_dims(tf.cast(tf.convert_to_tensor(comm_valid_mask), tf.float32), axis=-1)
+                comm_ctx_frozen = comm_ctx_frozen * valid
+                next_comm_ctx_frozen = next_comm_ctx_frozen * valid
 
         with tf.GradientTape() as tape:
             # ---- Compute comm context ----
@@ -285,6 +294,10 @@ class AdaptiveBDQ_agent:
                         all_next_obs_tf, training=False)
                     next_comm_ctx = tf.stop_gradient(
                         tf.gather_nd(next_all_context, indices))
+                    if comm_valid_mask is not None:
+                        valid = tf.expand_dims(tf.cast(tf.convert_to_tensor(comm_valid_mask), tf.float32), axis=-1)
+                        comm_ctx = comm_ctx * valid
+                        next_comm_ctx = next_comm_ctx * valid
                 else:
                     # Frozen context (pre-computed outside tape)
                     comm_ctx = comm_ctx_frozen

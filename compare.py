@@ -125,3 +125,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python compare.py -f /home/meathoo/RegionLight/TSC_RL_origin/TSC_RL/record/6x6_6_6_bi_originABDQ /home/meathoo/RegionLight/TSC_RL_origin/TSC_RL/record/6x6_6_6_bi_lf  /home/meathoo/RegionLight/TSC_RL_hie2/records/6x6_6_6_bi_hie2_lw  -n ABDQ lf hie2-2 --start 0 --smooth 100 -o ./comparison_results_6x6_lw_smooth100

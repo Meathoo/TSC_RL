@@ -212,8 +212,32 @@ class InterRegionCommunication(layers.Layer):
             layers.Dense(hidden_dim, name='msg_dec_dense2')
         ], name='message_decoder')
 
+        # Runtime diagnostics cache
+        self._last_gate_tensors = []
+        self._last_gate_stats = {}
+
+    def _update_gate_stats(self, gates):
+        self._last_gate_tensors = gates
+        if not gates:
+            self._last_gate_stats = {}
+            return
+        merged = tf.concat(gates, axis=-1)
+        self._last_gate_stats = {
+            'gate_mean': float(tf.reduce_mean(merged).numpy()),
+            'gate_std': float(tf.math.reduce_std(merged).numpy()),
+            'gate_sat_low': float(tf.reduce_mean(tf.cast(merged < 0.1, tf.float32)).numpy()),
+            'gate_sat_high': float(tf.reduce_mean(tf.cast(merged > 0.9, tf.float32)).numpy()),
+        }
+
+    def get_last_gate_tensors(self):
+        return self._last_gate_tensors
+
+    def get_last_gate_stats(self):
+        return self._last_gate_stats
+
     def call(self, region_features, region_adj_matrix, training=None):
         messages = self.msg_encoder(region_features)
+        gate_tensors = []
 
         for r in range(self.num_rounds):
             neighbor_agg = self.gat_layers[r](
@@ -225,8 +249,11 @@ class InterRegionCommunication(layers.Layer):
 
             gate_input = tf.concat([messages, neighbor_agg], axis=-1)
             gate = self.gate_layers[r](gate_input)
+            gate_tensors.append(gate)
             update = self.update_layers[r](neighbor_agg)
             messages = self.norm_layers[r](gate * update + (1.0 - gate) * messages)
+
+        self._update_gate_stats(gate_tensors)
 
         context = self.msg_decoder(messages)
         return context
@@ -299,6 +326,29 @@ class MeanFieldCommunication(layers.Layer):
         # Precomputed row-normalized adjacency (set in build or externally)
         self._adj_norm = None
 
+        # Runtime diagnostics cache
+        self._last_gate_tensors = []
+        self._last_gate_stats = {}
+
+    def _update_gate_stats(self, gates):
+        self._last_gate_tensors = gates
+        if not gates:
+            self._last_gate_stats = {}
+            return
+        merged = tf.concat(gates, axis=-1)
+        self._last_gate_stats = {
+            'gate_mean': float(tf.reduce_mean(merged).numpy()),
+            'gate_std': float(tf.math.reduce_std(merged).numpy()),
+            'gate_sat_low': float(tf.reduce_mean(tf.cast(merged < 0.1, tf.float32)).numpy()),
+            'gate_sat_high': float(tf.reduce_mean(tf.cast(merged > 0.9, tf.float32)).numpy()),
+        }
+
+    def get_last_gate_tensors(self):
+        return self._last_gate_tensors
+
+    def get_last_gate_stats(self):
+        return self._last_gate_stats
+
     def _get_adj_norm(self, adj_matrix):
         """Row-normalize adjacency (with self-loop) for mean aggregation."""
         if self._adj_norm is None:
@@ -317,6 +367,7 @@ class MeanFieldCommunication(layers.Layer):
         """
         adj_norm = self._get_adj_norm(region_adj_matrix)  # (N, N)
         messages = self.msg_encoder(region_features)       # (B, N, D)
+        gate_tensors = []
 
         for r in range(self.num_rounds):
             # Mean-field aggregation: matmul with row-normalized adjacency
@@ -326,8 +377,11 @@ class MeanFieldCommunication(layers.Layer):
 
             gate_input = tf.concat([messages, neighbor_agg], axis=-1)
             gate = self.gate_layers[r](gate_input)
+            gate_tensors.append(gate)
             update = self.update_layers[r](neighbor_agg)
             messages = self.norm_layers[r](gate * update + (1.0 - gate) * messages)
+
+        self._update_gate_stats(gate_tensors)
 
         return self.msg_decoder(messages)
 
@@ -450,6 +504,12 @@ class RegionCoordinator:
         self.comm_train_interval = config.get("COMM_TRAIN_INTERVAL", 10)
         self.comm_batch_size = config.get("COMM_BATCH_SIZE", 64)
         self.comm_buffer_size = config.get("COMM_BUFFER_SIZE", 50000)
+        self.gate_stats_enabled = config.get("GATE_STATS_ENABLED", True)
+        self.gate_stats_log_interval = config.get("GATE_STATS_LOG_INTERVAL", 100)
+        self.gate_reg_enabled = config.get("GATE_REG_ENABLED", False)
+        self.gate_reg_weight = config.get("GATE_REG_WEIGHT", 1e-3)
+        self.gate_reg_target_mean = config.get("GATE_REG_TARGET_MEAN", 0.5)
+        self.gate_reg_sat_threshold = config.get("GATE_REG_SAT_THRESHOLD", 0.05)
 
         # State encoder: raw obs → region feature vector
         self.state_encoder = tf.keras.Sequential([
@@ -510,6 +570,9 @@ class RegionCoordinator:
         self._buf_size = 0
 
         self.comm_loss_his = []
+        self.gate_reg_his = []
+        self.gate_stats_his = []
+        self.latest_gate_stats = {}
         self.train_step_count = 0
 
         # ---- End-to-End shared observation buffer ----
@@ -671,6 +734,25 @@ class RegionCoordinator:
             loss_neighbor = tf.reduce_mean(tf.square(neigh_pred - mean_neigh_rew))
 
             loss = loss_self + loss_neighbor
+            gate_reg = tf.constant(0.0, dtype=tf.float32)
+            if self.gate_reg_enabled:
+                gate_tensors = self.comm_module.get_last_gate_tensors()
+                if gate_tensors:
+                    reg_terms = []
+                    for g in gate_tensors:
+                        g_mean = tf.reduce_mean(g)
+                        sat_low = tf.reduce_mean(
+                            tf.cast(g < self.gate_reg_sat_threshold, tf.float32)
+                        )
+                        sat_high = tf.reduce_mean(
+                            tf.cast(g > (1.0 - self.gate_reg_sat_threshold), tf.float32)
+                        )
+                        reg_terms.append(
+                            tf.square(g_mean - self.gate_reg_target_mean) +
+                            0.25 * (sat_low + sat_high)
+                        )
+                    gate_reg = tf.add_n(reg_terms) / float(len(reg_terms))
+                    loss = loss + self.gate_reg_weight * gate_reg
 
         grads = tape.gradient(loss, train_vars)
         grads_and_vars = [(g, v) for g, v in zip(grads, train_vars) if g is not None]
@@ -681,8 +763,25 @@ class RegionCoordinator:
 
         loss_val = float(loss.numpy())
         self.comm_loss_his.append(loss_val)
+        self.gate_reg_his.append(float(gate_reg.numpy()))
         self.train_step_count += 1
+
+        if self.gate_stats_enabled and (
+            self.train_step_count % max(self.gate_stats_log_interval, 1) == 0
+        ):
+            stats = dict(self.comm_module.get_last_gate_stats())
+            if stats:
+                stats.update({
+                    'train_step': self.train_step_count,
+                    'gate_reg': float(gate_reg.numpy()),
+                })
+                self.latest_gate_stats = stats
+                self.gate_stats_his.append(stats)
+
         return loss_val
+
+    def get_latest_gate_stats(self):
+        return self.latest_gate_stats
 
     # ------------------------------------------------------------------
     #  Persistence

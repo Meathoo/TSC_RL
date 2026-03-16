@@ -87,6 +87,9 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
     episode_travel_time=[]
     comm_train_interval = BDQ_AGENT_CONFIG.get("COMM_CONFIG", {}).get("COMM_TRAIN_INTERVAL", 10)
     comm_warmup_steps = BDQ_AGENT_CONFIG.get("COMM_CONFIG", {}).get("COMM_WARMUP_STEPS", 10000)
+    comm_cfg = BDQ_AGENT_CONFIG.get("COMM_CONFIG", {})
+    curriculum_enabled = comm_cfg.get("COMM_CURRICULUM_ENABLED", False)
+    curriculum_start_step = comm_cfg.get("COMM_CURRICULUM_START_STEP", 0)
     profile_cfg = BDQ_AGENT_CONFIG.get("PROFILE_CONFIG", {})
     profile_enabled = profile_cfg.get("ENABLED", True)
     profile_print_interval = profile_cfg.get("PRINT_INTERVAL", 1)
@@ -123,10 +126,12 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
             # Pre-sample exploration decisions so we can skip unnecessary comm/NN forward.
             explore_flags = [np.random.random() <= agent.epsilon for agent in agents]
             need_greedy = not all(explore_flags)
+            comm_active = (coordinator is not None and
+                           (not curriculum_enabled or global_step >= curriculum_start_step))
 
             # ---- Level 1: Compute inter-region communication context ----
             comm_context = None  # (num_regions, hidden_dim) or None
-            if coordinator is not None and need_greedy:
+            if comm_active and need_greedy:
                 t_comm_fwd_start = time.perf_counter()
                 all_obs = np.stack(obs)
                 comm_context = coordinator.get_context(all_obs, training=False)
@@ -153,7 +158,7 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
             rewards = assign_reward(itsx_rewards,itsx_assignment)
 
             # ---- Level 1: Store communication training data ----
-            if coordinator is not None:
+            if comm_active:
                 all_next_obs = np.stack(next_obs)
                 coordinator.store(all_next_obs, rewards)
                 # End-to-end: only store step observations when E2E backprop is enabled.
@@ -239,7 +244,16 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
             "profile_agent_learn_pct": round(100.0 * ep_agent_learn_time / max(episode_wall_time, 1e-9), 2),
             "profile_choose_action_pct": round(100.0 * ep_choose_action_time / max(episode_wall_time, 1e-9), 2),
             "profile_comm_train_pct": round(100.0 * ep_comm_train_time / max(episode_wall_time, 1e-9), 2),
+            "comm_active": bool(not curriculum_enabled or global_step >= curriculum_start_step),
         }
+        if coordinator is not None:
+            gate_stats = coordinator.get_latest_gate_stats()
+            if gate_stats:
+                ep_log["gate_mean"] = round(float(gate_stats.get("gate_mean", 0.0)), 6)
+                ep_log["gate_std"] = round(float(gate_stats.get("gate_std", 0.0)), 6)
+                ep_log["gate_sat_low"] = round(float(gate_stats.get("gate_sat_low", 0.0)), 6)
+                ep_log["gate_sat_high"] = round(float(gate_stats.get("gate_sat_high", 0.0)), 6)
+                ep_log["gate_reg"] = round(float(gate_stats.get("gate_reg", 0.0)), 8)
         episode_logs.append(ep_log)
 
         log_msg={
@@ -342,6 +356,7 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
             "PER": agent_config.BDQ_AGENT_CONFIG.get("Prioritized_Experience_Replay", False),
             "noisy_net": agent_config.BDQ_AGENT_CONFIG.get("NoisyNet", False),
             "quick_profile": profile_enabled,
+            "comm_curriculum": curriculum_enabled,
         },
     }
 
