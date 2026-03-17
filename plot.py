@@ -52,15 +52,28 @@ if __name__ == "__main__":
         os.path.join(folder, "plot_throughput.png")
     )
 
-    # 4. average queue length
-    queue_length_path = os.path.join(folder, "episode_average_queue_length.npy")
-    queue_length = np.load(queue_length_path)
+    # 4. terminal queue length (fallback to legacy filename)
+    queue_length_terminal_path = os.path.join(folder, "episode_average_queue_length_terminal.npy")
+    if not os.path.exists(queue_length_terminal_path):
+        queue_length_terminal_path = os.path.join(folder, "episode_average_queue_length.npy")
+    queue_length_terminal = np.load(queue_length_terminal_path)
     plot_curve(
-        queue_length,
-        "Episode Average Queue Length",
-        "Average Queue Length",
-        os.path.join(folder, "plot_average_queue_length.png")
+        queue_length_terminal,
+        "Episode Terminal Queue Length",
+        "Queue Length",
+        os.path.join(folder, "plot_average_queue_length_terminal.png")
     )
+
+    # 5. episode-average queue length (step-wise)
+    queue_length_episode_avg_path = os.path.join(folder, "episode_average_queue_length_episode_avg.npy")
+    if os.path.exists(queue_length_episode_avg_path):
+        queue_length_episode_avg = np.load(queue_length_episode_avg_path)
+        plot_curve(
+            queue_length_episode_avg,
+            "Episode Average Queue Length (Step-wise)",
+            "Queue Length",
+            os.path.join(folder, "plot_average_queue_length_episode_avg.png")
+        )
 
 # usage python plot.py ./your_folder
 # example python plot.py records/Hangzhou_4_4_real_09_14_23_05_42_ABDQ
