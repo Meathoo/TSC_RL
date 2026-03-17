@@ -83,7 +83,8 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
     global_step=0 # global training step
     episode_intersection_level_rewards=[]
     episode_throughput=[]
-    episode_queue_length = [] # add
+    episode_queue_length = [] # terminal queue snapshot at episode end
+    episode_queue_length_episode_avg = []  # step-wise episode-average queue length
     episode_travel_time=[]
     comm_train_interval = BDQ_AGENT_CONFIG.get("COMM_CONFIG", {}).get("COMM_TRAIN_INTERVAL", 10)
     comm_warmup_steps = BDQ_AGENT_CONFIG.get("COMM_CONFIG", {}).get("COMM_WARMUP_STEPS", 10000)
@@ -113,6 +114,7 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
         episode_start_time=time.time()
         step_itsx_reward=[]
         episode_reward=[]
+        step_queue_length = []
         ep_env_step_time = 0.0
         ep_comm_forward_time = 0.0
         ep_agent_learn_time = 0.0
@@ -185,12 +187,15 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
             """----update step log---"""
             step_itsx_reward.append([value for _,value in itsx_rewards.items()])
             episode_reward.append(np.average(rewards))
+            step_queue_length.append(env.get_average_queue_length())
             """-----------------"""
             obs=next_obs
         """----update episode log------"""
         episode_throughput.append(env.get_throughput())
         episode_travel_time.append(env.get_average_travel_time())
-        episode_queue_length.append(env.get_average_queue_length())  # add
+        terminal_queue_length = env.get_average_queue_length()
+        episode_queue_length.append(terminal_queue_length)
+        episode_queue_length_episode_avg.append(float(np.mean(step_queue_length)) if step_queue_length else terminal_queue_length)
         episode_intersection_level_rewards.append(np.array(step_itsx_reward))
         """----------------------------"""
         episode_wall_time = time.time() - episode_start_time
@@ -224,7 +229,9 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
             "global_step": global_step,
             "episode_reward": round(float(np.sum(episode_reward)), 4),
             "avg_travel_time": round(env.get_average_travel_time(), 4),
-            "avg_queue_length": round(env.get_average_queue_length(), 4),
+            "avg_queue_length": round(terminal_queue_length, 4),
+            "avg_queue_length_terminal": round(terminal_queue_length, 4),
+            "avg_queue_length_episode": round(float(np.mean(step_queue_length)) if step_queue_length else terminal_queue_length, 4),
             "throughput": int(env.get_throughput()),
             "epsilon": round(float(agents[0].epsilon), 6),
             "avg_grad_norm": round(float(np.mean(agent_grad_norms)), 4) if agent_grad_norms else None,
@@ -262,7 +269,8 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
             "elapsed": time.strftime('%H:%M:%S', time.gmtime(elapsed_total)),
             "episode reward":round(float(np.sum(episode_reward)), 2),
             "average travel time": round(env.get_average_travel_time(), 2),
-            "average queue length": round(env.get_average_queue_length(), 4),
+            "average queue length": round(terminal_queue_length, 4),
+            "average queue length (episode avg)": round(float(np.mean(step_queue_length)) if step_queue_length else terminal_queue_length, 4),
             "throughput":int(env.get_throughput()),
             "epsilon":round(float(agents[0].epsilon), 6),
             "grad_norm": round(float(np.mean(agent_grad_norms)), 2) if agent_grad_norms else '-',
@@ -308,6 +316,9 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
     aql_array = np.array(episode_queue_length)
     best_aql = float(aql_array.min())
     best_aql_ep = int(aql_array.argmin())
+    aql_episode_array = np.array(episode_queue_length_episode_avg)
+    best_aql_episode = float(aql_episode_array.min())
+    best_aql_episode_ep = int(aql_episode_array.argmin())
 
     tp_array = np.array(episode_throughput)
     best_throughput = int(tp_array.max())
@@ -340,6 +351,8 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
         "last100_att": round(last100_att, 2),
         "best_aql": round(best_aql, 4),
         "best_aql_episode": best_aql_ep,
+        "best_aql_episode_avg": round(best_aql_episode, 4),
+        "best_aql_episode_avg_episode": best_aql_episode_ep,
         "best_throughput": best_throughput,
         "best_throughput_episode": best_throughput_ep,
         "converge_episode_rolling20_lt480": converge_ep,
@@ -391,6 +404,8 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=None):
     sim_log={'reward_log':episode_intersection_level_rewards,
              'throughput':episode_throughput,
              'queue_length':episode_queue_length,  # add
+             'queue_length_terminal':episode_queue_length,
+             'queue_length_episode_avg':episode_queue_length_episode_avg,
              'travel_time':episode_travel_time
              }
     return sim_log

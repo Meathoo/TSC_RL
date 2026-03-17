@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import argparse
+import math
 
 # 預設顏色與線型
 COLORS = [
@@ -19,10 +20,24 @@ def smooth_data(data, window_size=5):
 
 def load_metric(folder, metric_name):
     """載入指定資料夾的指標資料"""
-    file_path = os.path.join(folder, f"episode_{metric_name}.npy")
-    if not os.path.exists(file_path):
-        print(f"Warning: {file_path} not found")
+    candidates = []
+    if metric_name == 'average_queue_length_terminal':
+        candidates = [
+            os.path.join(folder, "episode_average_queue_length_terminal.npy"),
+            os.path.join(folder, "episode_average_queue_length.npy"),
+        ]
+    elif metric_name == 'average_queue_length_episode_avg':
+        candidates = [
+            os.path.join(folder, "episode_average_queue_length_episode_avg.npy"),
+        ]
+    else:
+        candidates = [os.path.join(folder, f"episode_{metric_name}.npy")]
+
+    file_path = next((p for p in candidates if os.path.exists(p)), None)
+    if file_path is None:
+        print(f"Warning: metric {metric_name} not found in {folder}")
         return None
+
     data = np.load(file_path)
     if data.ndim > 1:
         data = data.mean(axis=tuple(range(1, data.ndim)))
@@ -65,15 +80,19 @@ def plot_comparison(folders, names, output_folder, smooth_window=1, figsize=(16,
         ('average_travel_time', 'Average Travel Time', 'Average Travel Time (s)'),
         ('intersection_reward', 'Intersection Reward', 'Reward'),
         ('throughput', 'Throughput', 'Throughput (vehicles)'),
-        ('average_queue_length', 'Average Queue Length', 'Queue Length (vehicles)')
+        ('average_queue_length_terminal', 'Terminal Queue Length', 'Queue Length (vehicles)'),
+        ('average_queue_length_episode_avg', 'Episode-average Queue Length (Step-wise)', 'Queue Length (vehicles)')
     ]
     
     os.makedirs(output_folder, exist_ok=True)
     range_suffix = f"_{start_idx}_to_{end_idx if end_idx else 'end'}"
 
-    # 1. 繪製 2x2 總表
-    fig_all, axes = plt.subplots(2, 2, figsize=figsize)
-    axes_flat = axes.flatten()
+    # 1. 繪製總表（自動佈局）
+    n_metrics = len(metrics)
+    n_cols = 3 if n_metrics > 4 else 2
+    n_rows = int(math.ceil(n_metrics / n_cols))
+    fig_all, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes_flat = np.array(axes).reshape(-1)
     
     print(f"正在生成總表與個別指標圖 (範圍: {start_idx} 之後)...")
     
@@ -88,6 +107,10 @@ def plot_comparison(folders, names, output_folder, smooth_window=1, figsize=(16,
         single_output = os.path.join(output_folder, f"comparison_{m_info[0]}{range_suffix}.png")
         fig_single.savefig(single_output, dpi=150, bbox_inches='tight')
         plt.close(fig_single) # 釋放記憶體
+
+    # Hide unused subplots
+    for idx in range(n_metrics, len(axes_flat)):
+        axes_flat[idx].axis('off')
 
     # 儲存總表
     fig_all.tight_layout()
@@ -125,5 +148,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
+    
 # python compare.py -f /home/meathoo/RegionLight/TSC_RL_origin/TSC_RL/record/6x6_6_6_bi_originABDQ /home/meathoo/RegionLight/TSC_RL_origin/TSC_RL/record/6x6_6_6_bi_lf  /home/meathoo/RegionLight/TSC_RL_hie2/records/6x6_6_6_bi_hie2_lw  -n ABDQ lf hie2-2 --start 0 --smooth 100 -o ./comparison_results_6x6_lw_smooth100

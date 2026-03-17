@@ -26,12 +26,12 @@ BDQ_AGENT_CONFIG={
         "COMM_MESSAGE_DIM": 32,         # message compression dimension between regions
         "COMM_HIDDEN_DIM": 64,          # context vector dimension (State Encoder output dim)
         "COMM_NUM_HEADS": 4,            # GAT attention heads (only used when COMM_TYPE="GAT")
-        "COMM_NUM_ROUNDS": 2,           # communication rounds (multi-hop propagation)
+        "COMM_NUM_ROUNDS": 1,           # communication rounds (multi-hop propagation)
         "COMM_DROPOUT_RATE": 0.1,       # GAT attention dropout (only used when COMM_TYPE="GAT")
-        "COMM_LEARNING_RATE": 0.0001,   # Adam learning rate for communication module
+        "COMM_LEARNING_RATE": 5e-5,   # Adam learning rate for communication module
         "PROXIMITY_THRESHOLD": 2,       # Manhattan distance threshold for region adjacency
         # --- communication curriculum ---
-        "COMM_CURRICULUM_ENABLED": True,   # if True, delay communication activation
+        "COMM_CURRICULUM_ENABLED": False,   # if True, delay communication activation
         "COMM_CURRICULUM_START_STEP": 5000,    # enable communication when global_step >= this value
         "E2E_ENABLED": False,           # default off: use self-supervised comm training only (much faster)
         "E2E_FREQ": 5,                  # E2E backward through comm every N learn steps (1=always, 5=20% of steps)

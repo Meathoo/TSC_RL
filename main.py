@@ -200,8 +200,12 @@ def run_pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG,coordinator=No
     np.save(os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'],'episode_throughput.npy'), logs['throughput'])
     plot_curve(np.array(logs['travel_time']), "Episode Average Travel Time", "Average Travel Time", os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], "plot_average_travel_time.png")) # add
     np.save(os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'],'episode_average_travel_time.npy'), logs['travel_time']) 
-    plot_curve(np.array(logs['queue_length']), "Episode Average Queue Length", "Average Queue Length", os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], "plot_average_queue_length.png")) # add
-    np.save(os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'],'episode_average_queue_length.npy'), logs['queue_length'])  # add
+    plot_curve(np.array(logs['queue_length_terminal']), "Episode Terminal Queue Length", "Queue Length", os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], "plot_average_queue_length_terminal.png"))
+    np.save(os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'],'episode_average_queue_length.npy'), logs['queue_length_terminal'])
+    np.save(os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'],'episode_average_queue_length_terminal.npy'), logs['queue_length_terminal'])
+
+    plot_curve(np.array(logs['queue_length_episode_avg']), "Episode Average Queue Length (Step-wise)", "Queue Length", os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'], "plot_average_queue_length_episode_avg.png"))
+    np.save(os.path.join(ENV_CONFIG['PATH_TO_WORK_DIRECTORY'],'episode_average_queue_length_episode_avg.npy'), logs['queue_length_episode_avg'])
 
 if __name__ == "__main__":
     print("Is GPU available",tf.test.is_gpu_available())
