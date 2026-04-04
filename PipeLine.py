@@ -78,6 +78,7 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
             for i in range(len(agents)):
                 agents[i].learn()
     idle_branches_id=get_idle_branches(itsx_assignment)
+    use_batch_action_in_clde = bool(agent_config.BDQ_AGENT_CONFIG.get("USE_BATCH_ACTION_IN_CLDE", False))
     """----init global log-----"""
     global_step=0 # global training step
     episode_intersection_level_rewards=[]
@@ -106,9 +107,16 @@ def pipeline(env,agents,itsx_assignment,EXP_CONFIG,ENV_CONFIG):
             actions_id=[]
             global_step += 1
 
-            for aid,agent in enumerate(agents):
-                action_id=agent.choose_action(obs[aid],idle_branches_id[aid])
-                actions_id.append(action_id)
+            if (
+                EXP_CONFIG["TRAINING_PARADIM"] == "CLDE"
+                and use_batch_action_in_clde
+                and hasattr(agents[0], "choose_action_batch")
+            ):
+                actions_id = agents[0].choose_action_batch(obs, idle_branches_id)
+            else:
+                for aid,agent in enumerate(agents):
+                    action_id=agent.choose_action(obs[aid],idle_branches_id[aid])
+                    actions_id.append(action_id)
             joint_actions=convert_actions(actions_id,itsx_assignment)
 
             next_states, itsx_rewards, done, log_metric = env.step(joint_actions)

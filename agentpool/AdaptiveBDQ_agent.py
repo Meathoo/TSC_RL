@@ -111,6 +111,37 @@ class AdaptiveBDQ_agent:
                 joint_action[id] = -1
         return np.array(joint_action)
 
+    def choose_action_batch(self, states, idle_ids=None):
+        """
+        Optional batch inference path for CLDE action selection.
+        :param states: list/ndarray of shape [batch, state_dim]
+        :param idle_ids: list of idle-branch-index lists
+        :return: list of np.array joint actions
+        """
+        states = np.asarray(states, dtype=np.float32)
+        batch_size = states.shape[0]
+
+        if idle_ids is None:
+            idle_ids = [None] * batch_size
+
+        q_batch = self.eval_model(states).numpy()  # [batch, action_dim, subaction_num]
+        greedy_actions = np.argmax(q_batch, axis=2)
+
+        joint_actions_batch = []
+        for b in range(batch_size):
+            if np.random.random() > self.epsilon:
+                joint_action = greedy_actions[b].copy()
+            else:
+                joint_action = np.random.randint(0, self.subaction_num, size=(self.action_dim,))
+
+            if idle_ids[b] is not None:
+                for idle_idx in idle_ids[b]:
+                    joint_action[idle_idx] = -1
+
+            joint_actions_batch.append(np.array(joint_action))
+
+        return joint_actions_batch
+
     def learn(self):
         available_count = min(self.memory_size, self.memory_counter)
         self.learn_count += 1
